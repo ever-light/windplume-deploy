@@ -14,6 +14,16 @@ cargo build --release
 
 网页资源已编译进二进制，不需要 Node、CDN 或静态文件目录。
 
+每次代码推送到 `master` 分支时，GitHub Actions 会自动构建静态链接的 Linux
+x86_64 二进制，并创建 GitHub Release。版本格式为
+`0.1.<GitHub Actions run number>`，其中 `0.1` 来自 `Cargo.toml` 当前包版本的
+主、次版本。
+
+Release 包名类似
+`wind-plume-deploy-0.1.12-linux-x86_64.tar.gz`，同时提供 SHA256 校验文件。
+压缩包包含可直接安装到宿主机的二进制、示例配置和 systemd unit，不需要容器
+运行环境。
+
 ## 首次安装
 
 1. 创建专用系统用户和目录，并让它能够访问 Docker socket。注意：Docker socket 权限实际上接近宿主机 root 权限，只应授予可信专用用户。

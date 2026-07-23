@@ -1,0 +1,98 @@
+name: Build and publish Linux binary
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Calculate release version
+        id: package
+        shell: bash
+        run: |
+          package_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          version_prefix="${package_version%.*}"
+
+          if [[ -z "${version_prefix}" ]]; then
+            echo "Unable to read the package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          version="${version_prefix}.${GITHUB_RUN_NUMBER}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+          echo "archive=wind-plume-deploy-${version}-linux-x86_64.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain and musl linker
+        shell: bash
+        run: |
+          rustup toolchain install 1.96 --profile minimal --target "${TARGET}"
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-musl-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo +1.96 build --locked --release --target "${TARGET}"
+
+      - name: Package binary
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          package_dir="dist/wind-plume-deploy-${VERSION}-linux-x86_64"
+          mkdir -p "${package_dir}"
+
+          install -m 0755 "target/${TARGET}/release/wind-plume-deploy" \
+            "${package_dir}/wind-plume-deploy"
+          install -m 0644 README.md config.example.yaml \
+            deploy/wind-plume-deploy.service "${package_dir}/"
+
+          tar -C dist -czf "dist/${ARCHIVE}" \
+            "wind-plume-deploy-${VERSION}-linux-x86_64"
+          (
+            cd dist
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          )
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          gh release create "${TAG}" \
+            "dist/${ARCHIVE}" \
+            "dist/${ARCHIVE}.sha256" \
+            --target "${GITHUB_SHA}" \
+            --title "wind-plume-deploy ${VERSION}" \
+            --generate-notes
+
