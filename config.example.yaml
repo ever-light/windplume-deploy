@@ -1,0 +1,24 @@
+server:
+  listen: 127.0.0.1:8180
+github:
+  token_file: /etc/wind-plume-deploy/github-token
+  api_base: https://api.github.com
+  cache_seconds: 60
+storage:
+  data_dir: /var/lib/wind-plume-deploy
+  history_limit: 500
+  max_log_bytes: 65536
+compose:
+  project_name: wind-plume
+  file: /opt/wind-plume/compose.yaml
+  health_timeout_seconds: 120
+  command_timeout_seconds: 600
+services:
+  - id: identity
+    name: Identity Service
+    github_owner: ever-light
+    github_package: wind-plume-cloud-identity-service
+    image: ghcr.io/ever-light/wind-plume-cloud-identity-service
+    compose_service: identity-service
+    tag_pattern: '^\d+\.\d+\.\d+$'
+

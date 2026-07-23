@@ -1,0 +1,19 @@
+[Unit]
+Description=Wind Plume internal deployment service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=wind-plume-deploy
+Group=wind-plume-deploy
+WorkingDirectory=/var/lib/wind-plume-deploy
+ExecStart=/usr/local/bin/wind-plume-deploy --config /etc/wind-plume-deploy/config.yaml
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=wind_plume_deploy=info,tower_http=info
+
+[Install]
+WantedBy=multi-user.target
+

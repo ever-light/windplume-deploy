@@ -1,0 +1,13 @@
+services:
+  identity-service:
+    image: ghcr.io/ever-light/wind-plume-cloud-identity-service:0.1.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
