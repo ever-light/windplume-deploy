@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-service_name="wind-plume-deploy"
-service_user="wind-plume-deploy"
-service_group="wind-plume-deploy"
-config_dir="/etc/wind-plume-deploy"
-data_dir="/var/lib/wind-plume-deploy"
+service_name="windplume-deploy"
+service_user="windplume-deploy"
+service_group="windplume-deploy"
+config_dir="/etc/windplume-deploy"
+data_dir="/var/lib/windplume-deploy"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -13,11 +13,11 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-binary_source="${script_dir}/wind-plume-deploy"
+binary_source="${script_dir}/windplume-deploy"
 config_source="${script_dir}/config.example.yaml"
-unit_source="${script_dir}/wind-plume-deploy.service"
+unit_source="${script_dir}/windplume-deploy.service"
 if [[ ! -f "${unit_source}" ]]; then
-  unit_source="${script_dir}/deploy/wind-plume-deploy.service"
+  unit_source="${script_dir}/deploy/windplume-deploy.service"
 fi
 
 for source_file in "${binary_source}" "${config_source}" "${unit_source}"; do
@@ -82,7 +82,7 @@ if [[ "${config_created}" == true ]]; then
 else
   echo "1. 已保留现有配置：${config_dir}/config.yaml"
 fi
-echo "2. 写入 GitHub Token：sudoedit ${config_dir}/github-token"
-echo "3. 登录 GHCR：sudo -H -u ${service_user} docker login ghcr.io"
+echo "2. 私有 GitHub Packages 才需写入 Token：sudoedit ${config_dir}/github-token"
+echo "3. 私有镜像才需登录对应 Registry，例如：sudo -H -u ${service_user} docker login ghcr.io"
 echo "4. 启动服务：sudo systemctl start ${service_name}"
 echo "5. 查看状态：systemctl status ${service_name}"

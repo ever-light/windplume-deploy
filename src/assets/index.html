@@ -1,7 +1,7 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wind Plume Deploy</title><link rel="stylesheet" href="/assets/app.css"></head><body>
-<header><div><h1>Wind Plume Deploy</h1><p>内网服务版本管理</p></div><span id="global" class="pill">正在连接</span></header>
-<main><section><h2>服务</h2><div id="services" class="cards"><p class="muted">正在读取…</p></div></section>
-<section id="versions-section" hidden><div class="section-head"><div><h2 id="versions-title">可部署版本</h2><p class="muted">版本来自 GitHub Packages</p></div><button id="refresh">刷新</button></div><div class="table-wrap"><table><thead><tr><th>版本</th><th>更新时间</th><th>Digest</th><th></th></tr></thead><tbody id="versions"></tbody></table></div></section>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Windplume Deploy</title><link rel="stylesheet" href="/assets/app.css"></head><body>
+<header><div><h1>Windplume Deploy</h1><p>多 Compose 项目版本管理</p></div><span id="global" class="pill">正在连接</span></header>
+<main><section><h2>Compose 项目</h2><div id="projects"><p class="muted">正在读取…</p></div></section>
+<section id="versions-section" hidden><div class="section-head"><div><h2 id="versions-title">可部署版本</h2><p id="versions-source" class="muted"></p></div><button id="refresh">刷新</button></div><div class="table-wrap"><table><thead><tr><th>版本</th><th>更新时间</th><th>Digest</th><th></th></tr></thead><tbody id="versions"></tbody></table></div></section>
 <section><div class="section-head"><h2>部署历史</h2><button id="history-refresh">刷新</button></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>服务</th><th>版本变化</th><th>状态</th><th>耗时</th><th>回退</th></tr></thead><tbody id="history"></tbody></table></div></section></main>
 <dialog id="confirm"><form method="dialog"><h2>确认部署</h2><p id="confirm-text"></p><div class="actions"><button value="cancel">取消</button><button id="confirm-go" value="default" class="primary">开始部署</button></div></form></dialog>
 <dialog id="detail"><form method="dialog"><h2>部署详情</h2><p id="detail-summary"></p><pre id="detail-log"></pre><div class="actions"><button>关闭</button></div></form></dialog>

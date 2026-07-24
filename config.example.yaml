@@ -1,24 +1,64 @@
 server:
   listen: 127.0.0.1:8180
-github:
-  token_file: /etc/wind-plume-deploy/github-token
-  api_base: https://api.github.com
+
+registries:
   cache_seconds: 60
+  github:
+    # 只有使用 github_packages 来源读取私有包时才需要 token_file。
+    # token_file: /etc/windplume-deploy/github-token
+    api_base: https://api.github.com
+
 storage:
-  data_dir: /var/lib/wind-plume-deploy
+  data_dir: /var/lib/windplume-deploy
   history_limit: 500
   max_log_bytes: 65536
-compose:
-  project_name: wind-plume
-  file: /opt/wind-plume/compose.yaml
-  health_timeout_seconds: 120
-  command_timeout_seconds: 600
-services:
-  - id: identity
-    name: Identity Service
-    github_owner: ever-light
-    github_package: wind-plume-cloud-identity-service
-    image: ghcr.io/ever-light/wind-plume-cloud-identity-service
-    compose_service: identity-service
-    tag_pattern: '^\d+\.\d+\.\d+$'
 
+projects:
+  - id: windplume
+    name: Windplume
+    compose:
+      project_name: windplume
+      files:
+        - /opt/windplume/compose.yaml
+      health_timeout_seconds: 120
+      command_timeout_seconds: 600
+    services:
+      - id: frontend
+        name: Frontend
+        image: ghcr.io/ever-light/windplume-frontend
+        compose_service: frontend
+        tag_pattern: '^\d+\.\d+\.\d+$'
+        version_source:
+          type: oci_registry
+          registry: ghcr.io
+          repository: ever-light/windplume-frontend
+      - id: backend
+        name: Backend
+        image: ghcr.io/ever-light/windplume-backend
+        compose_service: backend
+        tag_pattern: '^\d+\.\d+\.\d+$'
+        version_source:
+          type: oci_registry
+          registry: ghcr.io
+          repository: ever-light/windplume-backend
+
+  - id: example-tools
+    name: Example Tools
+    compose:
+      project_name: example-tools
+      files:
+        - /opt/example-tools/compose.yaml
+        # 同一 Compose 项目需要多个基础文件时，可继续添加：
+        # - /opt/example-tools/compose.production.yaml
+      health_timeout_seconds: 120
+      command_timeout_seconds: 600
+    services:
+      - id: proxy
+        name: Proxy
+        image: library/nginx
+        compose_service: proxy
+        tag_pattern: '^\d+\.\d+\.\d+$'
+        version_source:
+          type: docker_hub
+          namespace: library
+          repository: nginx

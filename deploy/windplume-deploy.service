@@ -1,0 +1,18 @@
+[Unit]
+Description=Windplume internal deployment service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=windplume-deploy
+Group=windplume-deploy
+WorkingDirectory=/var/lib/windplume-deploy
+ExecStart=/usr/local/bin/windplume-deploy --config /etc/windplume-deploy/config.yaml
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=windplume_deploy=info,tower_http=info
+
+[Install]
+WantedBy=multi-user.target

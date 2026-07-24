@@ -1,13 +1,220 @@
-const $=s=>document.querySelector(s);let services=[],selected=null,busy=false;
-const esc=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(url,opt){const r=await fetch(url,opt);let data;try{data=await r.json()}catch{data={message:await r.text()}}if(!r.ok)throw new Error(data.message||`请求失败 (${r.status})`);return data}
-function toast(msg){const e=$('#toast');e.textContent=msg;e.style.display='block';setTimeout(()=>e.style.display='none',4000)}
-function badge(s){const ok=['healthy','running','succeeded'].includes(s);const bad=['unhealthy','failed','exited','dead','interrupted'].includes(s);return `<span class="pill ${ok?'ok':bad?'bad':''}">${esc(s)}</span>`}
-async function loadServices(){try{services=await api('/api/services');busy=services.some(s=>s.deployment_in_progress);$('#global').textContent=busy?'部署进行中':'空闲';$('#global').className=`pill ${busy?'':'ok'}`;$('#services').innerHTML=services.map(s=>`<article class="card" data-id="${esc(s.id)}"><div class="card-head"><div><h3>${esc(s.name)}</h3><span class="muted">${esc(s.compose_service)}</span></div>${badge(s.container_status)}</div><div class="kv"><span>期望版本</span><strong>${esc(s.desired_version)}</strong><span>期望镜像</span><code>${esc(s.desired_image)}</code><span>实际镜像</span><code>${esc(s.actual_image)}</code><span>一致性</span><span class="${s.drift?'drift':''}">${s.drift?'存在 drift':'一致'}</span></div></article>`).join('');document.querySelectorAll('.card').forEach(x=>x.onclick=()=>selectService(x.dataset.id));}catch(e){$('#services').innerHTML=`<p class="drift">${esc(e.message)}</p>`}}
-async function selectService(id,refresh=false){selected=services.find(s=>s.id===id);if(!selected)return;$('#versions-section').hidden=false;$('#versions-title').textContent=`${selected.name} · 可部署版本`;$('#versions').innerHTML='<tr><td colspan="4">正在读取…</td></tr>';try{const d=await api(`/api/services/${encodeURIComponent(id)}/packages?refresh=${refresh}`);$('#versions').innerHTML=d.versions.map(v=>`<tr><td><strong>${esc(v.version)}</strong>${v.version===selected.desired_version?' <span class="pill ok">当前</span>':''}</td><td>${new Date(v.updated_at).toLocaleString()}</td><td><code>${esc(v.digest)}</code></td><td><button class="deploy" data-version="${esc(v.version)}" ${busy||v.version===selected.desired_version?'disabled':''}>部署</button></td></tr>`).join('')||'<tr><td colspan="4">没有符合规则的标签</td></tr>';document.querySelectorAll('.deploy').forEach(x=>x.onclick=()=>confirmDeploy(x.dataset.version));}catch(e){$('#versions').innerHTML=`<tr><td colspan="4" class="drift">${esc(e.message)}</td></tr>`}}
-function confirmDeploy(version){$('#confirm-text').textContent=`服务：${selected.name}\n当前版本：${selected.desired_version||'未部署'}\n目标版本：${version}`;$('#confirm-go').onclick=async e=>{e.preventDefault();$('#confirm-go').disabled=true;try{const d=await api(`/api/services/${encodeURIComponent(selected.id)}/deploy`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version})});$('#confirm').close();toast(`任务 ${d.deployment_id} 已创建`);busy=true;await poll(d.deployment_id)}catch(err){toast(err.message)}finally{$('#confirm-go').disabled=false}};$('#confirm').showModal()}
-async function poll(id){for(;;){await new Promise(r=>setTimeout(r,2000));try{const d=await api(`/api/deployments/${id}`);await loadHistory();if(['succeeded','failed','interrupted'].includes(d.status)){busy=false;await loadServices();if(selected)await selectService(selected.id);toast(d.status==='succeeded'?'部署成功':`部署失败：${d.error_message||d.status}`);return}}catch(e){toast(e.message)}}}
-function elapsed(d){const end=d.finished_at?new Date(d.finished_at):new Date();return `${Math.max(0,Math.round((end-new Date(d.started_at))/1000))}s`}
-async function loadHistory(){try{const rows=await api('/api/deployments?limit=50');$('#history').innerHTML=rows.map(d=>`<tr data-id="${esc(d.id)}"><td>${new Date(d.started_at).toLocaleString()}</td><td>${esc(d.service_id)}</td><td>${esc(d.previous_version)} → ${esc(d.target_version)}</td><td>${badge(d.status)}</td><td>${elapsed(d)}</td><td>${esc(d.rollback_status)}</td></tr>`).join('')||'<tr><td colspan="6">暂无部署历史</td></tr>';document.querySelectorAll('#history tr[data-id]').forEach(x=>x.onclick=()=>showDetail(x.dataset.id));}catch(e){toast(e.message)}}
-async function showDetail(id){try{const d=await api(`/api/deployments/${id}`);$('#detail-summary').textContent=`${d.service_id}: ${d.previous_version||'未部署'} → ${d.target_version} · ${d.status}${d.error_message?' · '+d.error_message:''}`;$('#detail-log').textContent=d.command_log||'（无日志）';$('#detail').showModal()}catch(e){toast(e.message)}}
-$('#refresh').onclick=()=>selected&&selectService(selected.id,true);$('#history-refresh').onclick=loadHistory;loadServices();loadHistory();setInterval(()=>{loadServices();loadHistory()},10000);
+const $ = (selector) => document.querySelector(selector);
+let projects = [];
+let selected = null;
+
+const esc = (value) =>
+  String(value ?? "—").replace(
+    /[&<>"']/g,
+    (char) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        char
+      ],
+  );
+
+async function api(url, options) {
+  const response = await fetch(url, options);
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    data = { message: await response.text() };
+  }
+  if (!response.ok) {
+    throw new Error(data.message || `请求失败 (${response.status})`);
+  }
+  return data;
+}
+
+function toast(message) {
+  const element = $("#toast");
+  element.textContent = message;
+  element.style.display = "block";
+  setTimeout(() => (element.style.display = "none"), 4000);
+}
+
+function badge(status) {
+  const ok = ["healthy", "running", "succeeded"].includes(status);
+  const bad = ["unhealthy", "failed", "exited", "dead", "interrupted"].includes(
+    status,
+  );
+  return `<span class="pill ${ok ? "ok" : bad ? "bad" : ""}">${esc(status)}</span>`;
+}
+
+function serviceCard(project, service) {
+  return `<article class="card" data-project="${esc(project.id)}" data-service="${esc(service.id)}">
+    <div class="card-head">
+      <div><h3>${esc(service.name)}</h3><span class="muted">${esc(service.compose_service)} · ${esc(service.version_source)}</span></div>
+      ${badge(service.container_status)}
+    </div>
+    <div class="kv">
+      <span>期望版本</span><strong>${esc(service.desired_version)}</strong>
+      <span>期望镜像</span><code>${esc(service.desired_image)}</code>
+      <span>实际镜像</span><code>${esc(service.actual_image)}</code>
+      <span>一致性</span><span class="${service.drift ? "drift" : ""}">${service.drift ? "存在 drift" : "一致"}</span>
+    </div>
+  </article>`;
+}
+
+async function loadProjects() {
+  try {
+    projects = await api("/api/projects");
+    const busyCount = projects.filter((project) => project.deployment_in_progress).length;
+    $("#global").textContent = busyCount ? `${busyCount} 个项目部署中` : "空闲";
+    $("#global").className = `pill ${busyCount ? "" : "ok"}`;
+    $("#projects").innerHTML =
+      projects
+        .map(
+          (project) => `<section class="project-block">
+            <div class="project-head">
+              <div><h3>${esc(project.name)}</h3><p class="muted">${esc(project.compose_project_name)} · ${esc(project.compose_files.join(", "))}</p></div>
+              ${project.deployment_in_progress ? badge("部署中") : ""}
+            </div>
+            <div class="cards">${project.services.map((service) => serviceCard(project, service)).join("")}</div>
+          </section>`,
+        )
+        .join("") || '<p class="muted">没有配置 Compose 项目</p>';
+    document.querySelectorAll(".card").forEach((card) => {
+      card.onclick = () => selectService(card.dataset.project, card.dataset.service);
+    });
+  } catch (error) {
+    $("#projects").innerHTML = `<p class="drift">${esc(error.message)}</p>`;
+  }
+}
+
+async function selectService(projectId, serviceId, refresh = false) {
+  const project = projects.find((item) => item.id === projectId);
+  const service = project?.services.find((item) => item.id === serviceId);
+  if (!project || !service) return;
+  selected = { project, service };
+  $("#versions-section").hidden = false;
+  $("#versions-title").textContent = `${project.name} / ${service.name} · 可部署版本`;
+  $("#versions-source").textContent = `版本来源：${service.version_source}`;
+  $("#versions").innerHTML = '<tr><td colspan="4">正在读取…</td></tr>';
+  try {
+    const data = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/versions?refresh=${refresh}`,
+    );
+    $("#versions").innerHTML =
+      data.versions
+        .map(
+          (version) => `<tr>
+            <td><strong>${esc(version.version)}</strong>${version.version === service.desired_version ? ' <span class="pill ok">当前</span>' : ""}</td>
+            <td>${version.updated_at ? new Date(version.updated_at).toLocaleString() : "—"}</td>
+            <td><code>${esc(version.digest)}</code></td>
+            <td><button class="deploy" data-version="${esc(version.version)}" ${project.deployment_in_progress || version.version === service.desired_version ? "disabled" : ""}>部署</button></td>
+          </tr>`,
+        )
+        .join("") || '<tr><td colspan="4">没有符合规则的标签</td></tr>';
+    document.querySelectorAll(".deploy").forEach((button) => {
+      button.onclick = () => confirmDeploy(button.dataset.version);
+    });
+  } catch (error) {
+    $("#versions").innerHTML = `<tr><td colspan="4" class="drift">${esc(error.message)}</td></tr>`;
+  }
+}
+
+function confirmDeploy(version) {
+  const { project, service } = selected;
+  $("#confirm-text").textContent =
+    `项目：${project.name}\n服务：${service.name}\n当前版本：${service.desired_version || "未部署"}\n目标版本：${version}`;
+  $("#confirm-go").onclick = async (event) => {
+    event.preventDefault();
+    $("#confirm-go").disabled = true;
+    try {
+      const deployment = await api(
+        `/api/projects/${encodeURIComponent(project.id)}/services/${encodeURIComponent(service.id)}/deploy`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ version }),
+        },
+      );
+      $("#confirm").close();
+      toast(`任务 ${deployment.deployment_id} 已创建`);
+      await poll(deployment.deployment_id);
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      $("#confirm-go").disabled = false;
+    }
+  };
+  $("#confirm").showModal();
+}
+
+async function poll(id) {
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    try {
+      const deployment = await api(`/api/deployments/${id}`);
+      await loadHistory();
+      if (["succeeded", "failed", "interrupted"].includes(deployment.status)) {
+        const projectId = deployment.project_id;
+        const serviceId = deployment.service_id;
+        await loadProjects();
+        await selectService(projectId, serviceId);
+        toast(
+          deployment.status === "succeeded"
+            ? "部署成功"
+            : `部署失败：${deployment.error_message || deployment.status}`,
+        );
+        return;
+      }
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+}
+
+function elapsed(deployment) {
+  const end = deployment.finished_at
+    ? new Date(deployment.finished_at)
+    : new Date();
+  return `${Math.max(0, Math.round((end - new Date(deployment.started_at)) / 1000))}s`;
+}
+
+async function loadHistory() {
+  try {
+    const rows = await api("/api/deployments?limit=50");
+    $("#history").innerHTML =
+      rows
+        .map(
+          (deployment) => `<tr data-id="${esc(deployment.id)}">
+            <td>${new Date(deployment.started_at).toLocaleString()}</td>
+            <td>${esc(deployment.project_id)} / ${esc(deployment.service_id)}</td>
+            <td>${esc(deployment.previous_version)} → ${esc(deployment.target_version)}</td>
+            <td>${badge(deployment.status)}</td><td>${elapsed(deployment)}</td>
+            <td>${esc(deployment.rollback_status)}</td>
+          </tr>`,
+        )
+        .join("") || '<tr><td colspan="6">暂无部署历史</td></tr>';
+    document.querySelectorAll("#history tr[data-id]").forEach((row) => {
+      row.onclick = () => showDetail(row.dataset.id);
+    });
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function showDetail(id) {
+  try {
+    const deployment = await api(`/api/deployments/${id}`);
+    $("#detail-summary").textContent =
+      `${deployment.project_id} / ${deployment.service_id}: ${deployment.previous_version || "未部署"} → ${deployment.target_version} · ${deployment.status}` +
+      (deployment.error_message ? ` · ${deployment.error_message}` : "");
+    $("#detail-log").textContent = deployment.command_log || "（无日志）";
+    $("#detail").showModal();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+$("#refresh").onclick = () =>
+  selected &&
+  selectService(selected.project.id, selected.service.id, true);
+$("#history-refresh").onclick = loadHistory;
+loadProjects();
+loadHistory();
+setInterval(() => {
+  loadProjects();
+  loadHistory();
+}, 10000);

@@ -11,9 +11,15 @@ use serde::{Deserialize, Serialize};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/api/services", get(services))
-        .route("/api/services/{id}/packages", get(packages))
-        .route("/api/services/{id}/deploy", post(deploy))
+        .route("/api/projects", get(projects))
+        .route(
+            "/api/projects/{project_id}/services/{service_id}/versions",
+            get(versions),
+        )
+        .route(
+            "/api/projects/{project_id}/services/{service_id}/deploy",
+            post(deploy),
+        )
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
         .route("/", get(index))
@@ -21,9 +27,20 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/app.css", get(css))
         .with_state(state)
 }
-async fn health(State(s): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    s.storage.health().await?;
+
+async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    state.storage.health().await?;
     Ok(Json(serde_json::json!({"status":"ok"})))
+}
+
+#[derive(Serialize)]
+struct ProjectView {
+    id: String,
+    name: String,
+    compose_project_name: String,
+    compose_files: Vec<String>,
+    deployment_in_progress: bool,
+    services: Vec<ServiceView>,
 }
 
 #[derive(Serialize)]
@@ -31,106 +48,152 @@ struct ServiceView {
     id: String,
     name: String,
     compose_service: String,
+    image: String,
+    version_source: &'static str,
     desired_version: Option<String>,
     desired_image: Option<String>,
     actual_image: Option<String>,
     container_status: String,
     drift: bool,
-    deployment_in_progress: bool,
 }
-async fn services(State(s): State<AppState>) -> Result<Json<Vec<ServiceView>>, AppError> {
+
+async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>>, AppError> {
     let mut out = Vec::new();
-    let busy = s.deploy_lock.available_permits() == 0;
-    for svc in &s.config.services {
-        let desired = s.storage.state(&svc.id).await?;
-        let runtime = s
-            .compose
-            .runtime(
-                &svc.compose_service,
-                std::time::Duration::from_secs(15).min(s.config.command_timeout()),
-            )
-            .await;
-        let desired_image = desired.as_ref().map(|x| x.image.clone());
-        let drift = match (&desired_image, &runtime.actual_image) {
-            (Some(a), Some(b)) => a != b,
-            (None, None) => false,
-            _ => true,
-        };
-        out.push(ServiceView {
-            id: svc.id.clone(),
-            name: svc.name.clone(),
-            compose_service: svc.compose_service.clone(),
-            desired_version: desired.map(|x| x.desired_version),
-            desired_image,
-            actual_image: runtime.actual_image,
-            container_status: runtime.container_status,
-            drift,
+    for project in &state.config.projects {
+        let runtime = state
+            .project_runtime(&project.id)
+            .ok_or_else(|| AppError::Internal("Compose 项目运行时不存在".into()))?;
+        let busy = runtime.deploy_lock.available_permits() == 0;
+        let mut services = Vec::new();
+        for service in &project.services {
+            let desired = state.storage.state(&project.id, &service.id).await?;
+            let actual = runtime
+                .compose
+                .runtime(
+                    &service.compose_service,
+                    std::time::Duration::from_secs(15).min(project.compose.command_timeout()),
+                )
+                .await;
+            let desired_image = desired.as_ref().map(|item| item.image.clone());
+            let drift = match (&desired_image, &actual.actual_image) {
+                (Some(expected), Some(running)) => expected != running,
+                (None, None) => false,
+                _ => true,
+            };
+            services.push(ServiceView {
+                id: service.id.clone(),
+                name: service.name.clone(),
+                compose_service: service.compose_service.clone(),
+                image: service.image.clone(),
+                version_source: service.version_source.kind(),
+                desired_version: desired.map(|item| item.desired_version),
+                desired_image,
+                actual_image: actual.actual_image,
+                container_status: actual.container_status,
+                drift,
+            });
+        }
+        out.push(ProjectView {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            compose_project_name: project.compose.project_name.clone(),
+            compose_files: project
+                .compose
+                .files
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect(),
             deployment_in_progress: busy,
+            services,
         });
     }
     Ok(Json(out))
 }
+
 #[derive(Default, Deserialize)]
-struct PackageQuery {
+struct VersionQuery {
     #[serde(default)]
     refresh: bool,
 }
-async fn packages(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<PackageQuery>,
+
+async fn versions(
+    State(state): State<AppState>,
+    Path((project_id, service_id)): Path<(String, String)>,
+    Query(query): Query<VersionQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let svc = s
+    let service = state
         .config
-        .services
-        .iter()
-        .find(|x| x.id == id)
+        .service(&project_id, &service_id)
         .ok_or(AppError::NotFound)?;
-    let versions = s.github.versions(svc, q.refresh).await?;
-    Ok(Json(
-        serde_json::json!({"service_id":id,"versions":versions}),
-    ))
+    let cache_key = format!("{project_id}/{service_id}");
+    let versions = state
+        .registry
+        .versions(
+            &cache_key,
+            &service.version_source,
+            &service.tag_pattern,
+            query.refresh,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "project_id": project_id,
+        "service_id": service_id,
+        "source": service.version_source.kind(),
+        "versions": versions
+    })))
 }
+
 #[derive(Deserialize)]
 struct DeployRequest {
     version: String,
 }
+
 async fn deploy(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Path((project_id, service_id)): Path<(String, String)>,
     body: Result<Json<DeployRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AppError> {
-    let Json(req) = body.map_err(|e| AppError::Invalid(e.body_text()))?;
-    let d = deployment::enqueue(s, &id, req.version.trim()).await?;
+    let Json(request) = body.map_err(|error| AppError::Invalid(error.body_text()))?;
+    let deployment =
+        deployment::enqueue(state, &project_id, &service_id, request.version.trim()).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"deployment_id":d.id,"status":d.status})),
+        Json(serde_json::json!({
+            "deployment_id": deployment.id,
+            "status": deployment.status
+        })),
     ))
 }
+
 #[derive(Default, Deserialize)]
 struct HistoryQuery {
     limit: Option<u32>,
 }
+
 async fn deployments(
-    State(s): State<AppState>,
-    Query(q): Query<HistoryQuery>,
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<crate::storage::Deployment>>, AppError> {
     Ok(Json(
-        s.storage
-            .deployments(q.limit.unwrap_or(50).clamp(1, 500))
+        state
+            .storage
+            .deployments(query.limit.unwrap_or(50).clamp(1, 500))
             .await?,
     ))
 }
+
 async fn deployment(
-    State(s): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::storage::Deployment>, AppError> {
-    s.storage
+    state
+        .storage
         .deployment(&id)
         .await?
         .map(Json)
         .ok_or(AppError::NotFound)
 }
+
 async fn index() -> Html<&'static str> {
     Html(include_str!("assets/index.html"))
 }
@@ -152,12 +215,15 @@ mod tests {
     use super::*;
     use crate::{
         compose::{Compose, ProcessRunner},
-        config::{ComposeConfig, Config, GithubConfig, ServerConfig, StorageConfig},
-        github::GithubClient,
+        config::{
+            ComposeConfig, Config, ProjectConfig, RegistryConfig, ServerConfig, StorageConfig,
+        },
+        registry::RegistryClient,
+        state::ProjectRuntime,
         storage::Storage,
     };
     use axum::{body::Body, http::Request};
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
     use tokio::sync::Semaphore;
     use tower::ServiceExt;
 
@@ -166,53 +232,53 @@ mod tests {
         tokio::fs::write(&compose_file, "services: {}\n")
             .await
             .unwrap();
+        let project = ProjectConfig {
+            id: "app".into(),
+            name: "App".into(),
+            compose: ComposeConfig {
+                project_name: "app".into(),
+                files: vec![compose_file],
+                health_timeout_seconds: 1,
+                command_timeout_seconds: 1,
+            },
+            services: Vec::new(),
+        };
         let config = Arc::new(Config {
             server: ServerConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
             },
-            github: GithubConfig {
-                token_file: PathBuf::from("unused"),
-                api_base: "http://127.0.0.1:1".into(),
-                cache_seconds: 60,
-            },
+            registries: RegistryConfig::default(),
             storage: StorageConfig {
                 data_dir: dir.path().into(),
                 history_limit: 10,
                 max_log_bytes: 1024,
             },
-            compose: ComposeConfig {
-                project_name: "test".into(),
-                file: compose_file,
-                health_timeout_seconds: 1,
-                command_timeout_seconds: 1,
-            },
-            services: Vec::new(),
+            projects: vec![project.clone()],
         });
         let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
-        let github = GithubClient::new(
-            config.github.api_base.clone(),
-            "secret".into(),
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let registry =
+            RegistryClient::new("http://127.0.0.1:1".into(), None, Duration::from_secs(60))
+                .unwrap();
         let override_file = dir.path().join("override.yaml");
-        let compose = Compose::new(
-            config.compose.clone(),
-            override_file.clone(),
-            Arc::new(ProcessRunner),
-        );
+        let runtime = ProjectRuntime {
+            compose: Compose::new(
+                project.compose,
+                override_file.clone(),
+                Arc::new(ProcessRunner),
+            ),
+            override_file,
+            deploy_lock: Arc::new(Semaphore::new(1)),
+        };
         router(AppState {
             config,
             storage,
-            github,
-            compose,
-            override_file,
-            deploy_lock: Arc::new(Semaphore::new(1)),
+            registry,
+            projects: Arc::new(HashMap::from([("app".into(), runtime)])),
         })
     }
 
     #[tokio::test]
-    async fn health_static_assets_and_json_rejection_have_expected_content_type() {
+    async fn health_projects_static_assets_and_json_rejection_work() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(&dir).await;
         let health = app
@@ -222,6 +288,13 @@ mod tests {
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
         assert_eq!(health.headers()[header::CONTENT_TYPE], "application/json");
+
+        let projects = app
+            .clone()
+            .oneshot(Request::get("/api/projects").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(projects.status(), StatusCode::OK);
 
         let js = app
             .clone()
@@ -235,7 +308,7 @@ mod tests {
 
         let rejected = app
             .oneshot(
-                Request::post("/api/services/missing/deploy")
+                Request::post("/api/projects/app/services/missing/deploy")
                     .header(header::CONTENT_TYPE, "text/plain")
                     .body(Body::from("no"))
                     .unwrap(),

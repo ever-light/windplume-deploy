@@ -3,7 +3,7 @@ use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("未找到服务")]
+    #[error("未找到 Compose 项目或服务")]
     NotFound,
     #[error("请求格式无效: {0}")]
     Invalid(String),

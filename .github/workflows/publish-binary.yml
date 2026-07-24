@@ -39,7 +39,7 @@ jobs:
           version="${version_prefix}.${GITHUB_RUN_NUMBER}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
-          echo "archive=wind-plume-deploy-${version}-linux-x86_64.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "archive=windplume-deploy-${version}-linux-x86_64.tar.gz" >> "${GITHUB_OUTPUT}"
 
       - name: Install Rust toolchain and musl linker
         shell: bash
@@ -66,17 +66,17 @@ jobs:
           ARCHIVE: ${{ steps.package.outputs.archive }}
         shell: bash
         run: |
-          package_dir="dist/wind-plume-deploy-${VERSION}-linux-x86_64"
+          package_dir="dist/windplume-deploy-${VERSION}-linux-x86_64"
           mkdir -p "${package_dir}"
 
-          install -m 0755 "target/${TARGET}/release/wind-plume-deploy" \
-            "${package_dir}/wind-plume-deploy"
+          install -m 0755 "target/${TARGET}/release/windplume-deploy" \
+            "${package_dir}/windplume-deploy"
           install -m 0644 README.md config.example.yaml \
-            deploy/wind-plume-deploy.service "${package_dir}/"
+            deploy/windplume-deploy.service "${package_dir}/"
           install -m 0755 install.sh "${package_dir}/install.sh"
 
           tar -C dist -czf "dist/${ARCHIVE}" \
-            "wind-plume-deploy-${VERSION}-linux-x86_64"
+            "windplume-deploy-${VERSION}-linux-x86_64"
           (
             cd dist
             sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
@@ -94,5 +94,5 @@ jobs:
             "dist/${ARCHIVE}" \
             "dist/${ARCHIVE}.sha256" \
             --target "${GITHUB_SHA}" \
-            --title "wind-plume-deploy ${VERSION}" \
+            --title "windplume-deploy ${VERSION}" \
             --generate-notes

@@ -15,6 +15,7 @@ pub struct Storage {
 
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct ServiceState {
+    pub project_id: String,
     pub service_id: String,
     pub desired_version: String,
     pub image: String,
@@ -25,6 +26,7 @@ pub struct ServiceState {
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct Deployment {
     pub id: String,
+    pub project_id: String,
     pub service_id: String,
     pub previous_version: Option<String>,
     pub target_version: String,
@@ -75,20 +77,26 @@ impl Storage {
         tx.rollback().await?;
         Ok(())
     }
-    pub async fn states(&self) -> Result<Vec<ServiceState>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM service_state ORDER BY service_id")
+    pub async fn states(&self, project_id: &str) -> Result<Vec<ServiceState>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM service_state WHERE project_id=? ORDER BY service_id")
+            .bind(project_id)
             .fetch_all(&self.pool)
             .await
     }
-    pub async fn state(&self, id: &str) -> Result<Option<ServiceState>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM service_state WHERE service_id=?")
-            .bind(id)
+    pub async fn state(
+        &self,
+        project_id: &str,
+        service_id: &str,
+    ) -> Result<Option<ServiceState>, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM service_state WHERE project_id=? AND service_id=?")
+            .bind(project_id)
+            .bind(service_id)
             .fetch_optional(&self.pool)
             .await
     }
     pub async fn create_deployment(&self, d: &Deployment) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO deployments(id,service_id,previous_version,target_version,status,started_at,command_log) VALUES(?,?,?,?,?,?,?)")
-            .bind(&d.id).bind(&d.service_id).bind(&d.previous_version).bind(&d.target_version)
+        sqlx::query("INSERT INTO deployments(id,project_id,service_id,previous_version,target_version,status,started_at,command_log) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&d.id).bind(&d.project_id).bind(&d.service_id).bind(&d.previous_version).bind(&d.target_version)
             .bind(&d.status).bind(&d.started_at).bind(&d.command_log).execute(&self.pool).await?;
         self.prune().await
     }
@@ -102,6 +110,7 @@ impl Storage {
     pub async fn finish_success(
         &self,
         id: &str,
+        project_id: &str,
         service_id: &str,
         version: &str,
         image: &str,
@@ -110,8 +119,8 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
         let log = truncate_utf8(log, self.max_log_bytes);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO service_state(service_id,desired_version,image,updated_at,last_deployment_id) VALUES(?,?,?,?,?) ON CONFLICT(service_id) DO UPDATE SET desired_version=excluded.desired_version,image=excluded.image,updated_at=excluded.updated_at,last_deployment_id=excluded.last_deployment_id")
-            .bind(service_id).bind(version).bind(image).bind(&now).bind(id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO service_state(project_id,service_id,desired_version,image,updated_at,last_deployment_id) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,service_id) DO UPDATE SET desired_version=excluded.desired_version,image=excluded.image,updated_at=excluded.updated_at,last_deployment_id=excluded.last_deployment_id")
+            .bind(project_id).bind(service_id).bind(version).bind(image).bind(&now).bind(id).execute(&mut *tx).await?;
         sqlx::query("UPDATE deployments SET status='succeeded',finished_at=?,command_log=?,rollback_status='not_needed' WHERE id=?")
             .bind(&now).bind(log).bind(id).execute(&mut *tx).await?;
         tx.commit().await
@@ -175,6 +184,7 @@ mod tests {
         for number in 0..3 {
             let deployment = Deployment {
                 id: number.to_string(),
+                project_id: "app".into(),
                 service_id: "svc".into(),
                 previous_version: None,
                 target_version: format!("1.0.{number}"),
@@ -199,5 +209,37 @@ mod tests {
                 .all(|item| item.status == "interrupted")
         );
         reopened.health().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_service_id_is_isolated_between_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        storage
+            .finish_success("one", "frontend", "web", "1.0.0", "image:1.0.0", "")
+            .await
+            .unwrap();
+        storage
+            .finish_success("two", "backend", "web", "2.0.0", "image:2.0.0", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .state("frontend", "web")
+                .await
+                .unwrap()
+                .unwrap()
+                .desired_version,
+            "1.0.0"
+        );
+        assert_eq!(
+            storage
+                .state("backend", "web")
+                .await
+                .unwrap()
+                .unwrap()
+                .desired_version,
+            "2.0.0"
+        );
     }
 }

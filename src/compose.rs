@@ -158,18 +158,19 @@ impl Compose {
         }
     }
     fn cwd(&self) -> &Path {
-        self.cfg.file.parent().unwrap_or_else(|| Path::new("."))
+        self.cfg.files[0].parent().unwrap_or_else(|| Path::new("."))
     }
     fn base_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "compose".into(),
             "--project-name".into(),
             self.cfg.project_name.clone(),
-            "-f".into(),
-            self.cfg.file.display().to_string(),
-            "-f".into(),
-            self.override_file.display().to_string(),
-        ]
+        ];
+        for file in &self.cfg.files {
+            args.extend(["-f".into(), file.display().to_string()]);
+        }
+        args.extend(["-f".into(), self.override_file.display().to_string()]);
+        args
     }
     pub async fn up(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
         let mut args = self.base_args();
@@ -326,11 +327,14 @@ mod tests {
         let s = ServiceConfig {
             id: "a".into(),
             name: "A".into(),
-            github_owner: "o".into(),
-            github_package: "p".into(),
             image: "ghcr.io/o/i".into(),
             compose_service: "svc".into(),
             tag_pattern: ".*".into(),
+            version_source: crate::config::VersionSourceConfig::GithubPackages {
+                owner: "o".into(),
+                package: "p".into(),
+                owner_kind: crate::config::GithubOwnerKind::User,
+            },
         };
         let mut v = BTreeMap::new();
         v.insert("a".into(), "1.2.3".into());
@@ -365,7 +369,7 @@ mod tests {
         let compose = Compose::new(
             ComposeConfig {
                 project_name: "test".into(),
-                file: compose_file,
+                files: vec![compose_file],
                 health_timeout_seconds: 1,
                 command_timeout_seconds: 1,
             },
