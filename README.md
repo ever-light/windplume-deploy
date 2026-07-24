@@ -21,47 +21,46 @@ x86_64 二进制，并创建 GitHub Release。版本格式为
 
 Release 包名类似
 `wind-plume-deploy-0.1.12-linux-x86_64.tar.gz`，同时提供 SHA256 校验文件。
-压缩包包含可直接安装到宿主机的二进制、示例配置和 systemd unit，不需要容器
-运行环境。
+压缩包包含可直接安装到宿主机的二进制、初始化脚本、示例配置和 systemd
+unit，不需要项目源码或 Rust 构建环境。
 
 ## 首次安装
 
-1. 创建专用系统用户和目录，并让它能够访问 Docker socket。注意：Docker socket 权限实际上接近宿主机 root 权限，只应授予可信专用用户。
+项目没有应用层的用户或“空间/工作区”，无需在网页中额外创建。下面的
+`wind-plume-deploy` 是宿主机上的 Linux 服务账号，两个目录分别保存配置和
+SQLite 数据。若使用仓库提供的 systemd unit，需要在首次安装时创建一次；后续
+升级无需重复创建。专用用户不是程序的硬性要求，但可以隔离服务文件和 GHCR
+凭据，避免进程直接以 root 身份运行，因此初始化脚本默认创建并使用它。由于该
+用户可以访问 Docker socket，其主机权限实际上仍接近 root，只应将网页开放到
+可信内网。
 
-   ```bash
-   sudo useradd --system --home /var/lib/wind-plume-deploy --shell /usr/sbin/nologin wind-plume-deploy
-   sudo install -d -o wind-plume-deploy -g wind-plume-deploy /etc/wind-plume-deploy /var/lib/wind-plume-deploy
-   ```
+从 GitHub Release 下载并校验压缩包，复制到部署机后解压。进入解压后的目录，
+直接执行：
 
-2. 创建能读取目标私有个人包的 GitHub Token，将它单独保存且限制权限。Token 只调用 Packages API，不用于拉取镜像。
+```bash
+sudo ./install.sh
+```
 
-   ```bash
-   sudo install -o wind-plume-deploy -g wind-plume-deploy -m 0600 /dev/null /etc/wind-plume-deploy/github-token
-   sudoedit /etc/wind-plume-deploy/github-token
-   ```
+脚本会创建专用系统用户和目录、授予 Docker socket 访问权限，并安装二进制、
+示例配置和 systemd unit。它可以重复执行，且不会覆盖已有的 `config.yaml`。
+为避免使用空 Token 或错误的 Compose 路径，脚本只启用开机启动，不会立即启动
+服务。
 
-3. 以 systemd 最终使用的同一 Linux 用户登录 GHCR。Docker 会自行保存拉取凭据；本程序不执行登录，也不读取密码。
+根据脚本最后输出的提示完成以下操作：
 
-   ```bash
-   sudo -u wind-plume-deploy docker login ghcr.io
-   sudo -u wind-plume-deploy docker compose version
-   sudo -u wind-plume-deploy test -r /opt/wind-plume/compose.yaml
-   ```
+```bash
+sudoedit /etc/wind-plume-deploy/config.yaml
+sudoedit /etc/wind-plume-deploy/github-token
+sudo -H -u wind-plume-deploy docker login ghcr.io
+sudo -H -u wind-plume-deploy docker compose version
+sudo -H -u wind-plume-deploy test -r /opt/wind-plume/compose.yaml
+sudo systemctl start wind-plume-deploy
+```
 
-4. 复制并修改配置。`services.id` 与 `compose_service` 必须唯一。若要让内网其他主机访问，显式把监听地址改为受防火墙保护的内网 IP 或 `0.0.0.0`。
-
-   ```bash
-   sudo install -o root -g wind-plume-deploy -m 0640 config.example.yaml /etc/wind-plume-deploy/config.yaml
-   ```
-
-5. 安装二进制与 systemd unit：
-
-   ```bash
-   sudo install -m 0755 target/release/wind-plume-deploy /usr/local/bin/wind-plume-deploy
-   sudo install -m 0644 deploy/wind-plume-deploy.service /etc/systemd/system/wind-plume-deploy.service
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now wind-plume-deploy
-   ```
+GitHub Token 只用于 Packages API，需能读取目标私有个人包；镜像拉取凭据由
+Docker 保存在服务用户的 home 目录，本程序不读取密码。`services.id` 与
+`compose_service` 必须唯一。若要让内网其他主机访问，应显式把监听地址改为受
+防火墙保护的内网 IP 或 `0.0.0.0`。
 
 ## 运行与排障
 
@@ -81,12 +80,13 @@ curl http://127.0.0.1:8180/health
 
 程序只原子改写数据目录下的 `compose.deploy.yaml`，不会修改基础 Compose、`.env` 或业务仓库。启动时会把遗留的 queued/running 任务标为 interrupted，并从 SQLite 重建 override。
 
-升级时先备份 `/var/lib/wind-plume-deploy/deploy.db`，替换 release 二进制后重启：
+升级时解压新的 Release 包，在新目录中先备份数据库，再重新执行安装脚本并
+启动。已有配置、Token 和数据不会被覆盖：
 
 ```bash
 sudo systemctl stop wind-plume-deploy
 sudo cp /var/lib/wind-plume-deploy/deploy.db /var/lib/wind-plume-deploy/deploy.db.backup
-sudo install -m 0755 target/release/wind-plume-deploy /usr/local/bin/wind-plume-deploy
+sudo ./install.sh
 sudo systemctl start wind-plume-deploy
 ```
 

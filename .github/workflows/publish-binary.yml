@@ -73,6 +73,7 @@ jobs:
             "${package_dir}/wind-plume-deploy"
           install -m 0644 README.md config.example.yaml \
             deploy/wind-plume-deploy.service "${package_dir}/"
+          install -m 0755 install.sh "${package_dir}/install.sh"
 
           tar -C dist -czf "dist/${ARCHIVE}" \
             "wind-plume-deploy-${VERSION}-linux-x86_64"
@@ -95,4 +96,3 @@ jobs:
             --target "${GITHUB_SHA}" \
             --title "wind-plume-deploy ${VERSION}" \
             --generate-notes
-
