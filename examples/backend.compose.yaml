@@ -1,5 +1,5 @@
 services:
-  identity-service:
+  windplume-cloud-identity-service:
     image: ghcr.io/ever-light/windplume-cloud-identity-service:0.1.1
     restart: unless-stopped
     ports:

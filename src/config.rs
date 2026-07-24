@@ -30,6 +30,9 @@ fn default_health() -> u64 {
 fn default_command() -> u64 {
     600
 }
+fn default_tag_pattern() -> String {
+    r"^\d+\.\d+\.\d+$".into()
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -118,6 +121,7 @@ pub struct ServiceConfig {
     pub name: String,
     pub image: String,
     pub compose_service: String,
+    #[serde(default = "default_tag_pattern")]
     pub tag_pattern: String,
     pub version_source: VersionSourceConfig,
 }
@@ -359,6 +363,51 @@ mod tests {
             }],
         });
         assert!(cfg.validate().unwrap().is_none());
+    }
+
+    #[test]
+    fn minimal_yaml_uses_operational_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = dir.path().join("compose.yaml");
+        fs::write(&compose, "services: {}\n").unwrap();
+        let config = dir.path().join("config.yaml");
+        fs::write(
+            &config,
+            format!(
+                r#"
+storage:
+  data_dir: {}
+projects:
+  - id: web
+    name: Web
+    compose:
+      project_name: web
+      files: [{}]
+    services:
+      - id: web
+        name: Web
+        image: ghcr.io/owner/web
+        compose_service: web
+        version_source:
+          type: oci_registry
+          registry: ghcr.io
+          repository: owner/web
+"#,
+                dir.path().join("data").display(),
+                compose.display()
+            ),
+        )
+        .unwrap();
+
+        let (cfg, token) = Config::load(&config).unwrap();
+        assert!(token.is_none());
+        assert_eq!(cfg.server.listen, default_listen());
+        assert_eq!(cfg.registries.cache_seconds, 60);
+        assert_eq!(cfg.storage.history_limit, 500);
+        assert_eq!(cfg.storage.max_log_bytes, 65536);
+        assert_eq!(cfg.projects[0].compose.health_timeout_seconds, 120);
+        assert_eq!(cfg.projects[0].compose.command_timeout_seconds, 600);
+        assert_eq!(cfg.projects[0].services[0].tag_pattern, r"^\d+\.\d+\.\d+$");
     }
 
     #[test]

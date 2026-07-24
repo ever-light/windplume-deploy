@@ -79,29 +79,50 @@ Registry。若要让内网其他主机访问，应显式把监听地址改为受
 配置结构示例：
 
 ```yaml
+storage:
+  data_dir: /var/lib/windplume-deploy
+
 projects:
-  - id: windplume
-    name: Windplume
+  - id: windplume-cloud
+    name: Windplume Cloud
     compose:
-      project_name: windplume
+      project_name: windplume-cloud
       files:
-        - /opt/windplume/compose.yaml
-      health_timeout_seconds: 120
-      command_timeout_seconds: 600
+        - /opt/windplume/windplume-cloud/compose.yaml
     services:
-      - id: frontend
-        name: Frontend
-        image: ghcr.io/ever-light/windplume-frontend
-        compose_service: frontend
-        tag_pattern: '^\d+\.\d+\.\d+$'
+      - id: identity
+        name: Identity Service
+        image: ghcr.io/ever-light/windplume-cloud-identity-service
+        compose_service: windplume-cloud-identity-service
         version_source:
           type: oci_registry
           registry: ghcr.io
-          repository: ever-light/windplume-frontend
+          repository: ever-light/windplume-cloud-identity-service
+
+  - id: windplume-web
+    name: Windplume Web
+    compose:
+      project_name: windplume-web
+      files:
+        - /opt/windplume/windplume-web/compose.yaml
+    services:
+      - id: web
+        name: Web
+        image: ghcr.io/ever-light/windplume-web
+        compose_service: windplume-web
+        version_source:
+          type: oci_registry
+          registry: ghcr.io
+          repository: ever-light/windplume-web
 ```
 
-完整的多项目、公开 GHCR 和 Docker Hub 示例见 `config.example.yaml`。项目 ID
+完整的前后端双项目示例见 `config.example.yaml`，对应的两个独立 Compose 文件
+见 `examples/backend.compose.yaml` 和 `examples/frontend.compose.yaml`。项目 ID
 全局唯一；服务 ID 和 `compose_service` 只需在所属项目内唯一。
+
+示例省略的配置均有默认值：监听地址 `127.0.0.1:8180`、标签缓存 60 秒、历史
+上限 500 条、日志上限 65536 字节、健康检查超时 120 秒、命令超时 600 秒，
+以及匹配 `x.y.z` 的默认 `tag_pattern`。只有需要覆盖默认行为时才需写入配置。
 
 ## 安装位置
 
