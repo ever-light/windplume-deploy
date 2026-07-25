@@ -28,7 +28,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let (cfg, token) = Config::load(&args.config)?;
+    let mut cfg = Config::load(&args.config)?;
+    let runner = Arc::new(ProcessRunner);
+    for project in &mut cfg.projects {
+        compose::resolve_project(project, runner.clone()).await?;
+    }
+    cfg.validate_resolved()?;
     let cfg = Arc::new(cfg);
     let storage = storage::Storage::open(
         &cfg.storage.data_dir,
@@ -36,12 +41,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.storage.max_log_bytes,
     )
     .await?;
-    let registry = registry::RegistryClient::new(
-        cfg.registries.github.api_base.clone(),
-        token,
-        Duration::from_secs(cfg.registries.cache_seconds),
-    )?;
-    let runner = Arc::new(ProcessRunner);
+    let registry =
+        registry::RegistryClient::new(Duration::from_secs(cfg.registries.cache_seconds))?;
     let projects = cfg
         .projects
         .iter()
@@ -56,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
                 project.id.clone(),
                 ProjectRuntime {
                     compose: compose::Compose::new(
-                        project.compose.clone(),
+                        project.clone(),
                         override_file.clone(),
                         runner.clone(),
                     ),

@@ -1,4 +1,4 @@
-use crate::config::{ComposeConfig, ServiceConfig};
+use crate::config::{ProjectConfig, ServiceConfig, service_from_image};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -79,7 +79,7 @@ pub async fn write_override(
             .get(id.as_str())
             .ok_or_else(|| anyhow::anyhow!("未知服务状态 {id}"))?;
         map.insert(
-            svc.compose_service.clone(),
+            svc.id.clone(),
             OverrideService {
                 image: format!("{}:{}", svc.image, version),
             },
@@ -109,7 +109,7 @@ pub async fn write_override(
 
 #[derive(Clone)]
 pub struct Compose {
-    cfg: ComposeConfig,
+    cfg: ProjectConfig,
     override_file: PathBuf,
     runner: std::sync::Arc<dyn CommandRunner>,
 }
@@ -147,7 +147,7 @@ struct InspectHealth {
 
 impl Compose {
     pub fn new(
-        cfg: ComposeConfig,
+        cfg: ProjectConfig,
         override_file: PathBuf,
         runner: std::sync::Arc<dyn CommandRunner>,
     ) -> Self {
@@ -158,19 +158,30 @@ impl Compose {
         }
     }
     fn cwd(&self) -> &Path {
-        self.cfg.files[0].parent().unwrap_or_else(|| Path::new("."))
+        self.cfg.project_dir()
     }
     fn base_args(&self) -> Vec<String> {
         let mut args = vec![
             "compose".into(),
             "--project-name".into(),
-            self.cfg.project_name.clone(),
+            self.cfg.id.clone(),
+            "--project-directory".into(),
+            self.cfg.project_dir().display().to_string(),
         ];
-        for file in &self.cfg.files {
+        for file in &self.cfg.compose_files {
             args.extend(["-f".into(), file.display().to_string()]);
         }
         args.extend(["-f".into(), self.override_file.display().to_string()]);
         args
+    }
+    pub async fn pull(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
+        let mut args = self.base_args();
+        args.extend(["pull".into(), service.into()]);
+        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose pull 执行失败\n{}", out.log);
+        }
+        Ok(out.log)
     }
     pub async fn up(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
         let mut args = self.base_args();
@@ -301,6 +312,60 @@ impl Compose {
     }
 }
 
+#[derive(Deserialize)]
+struct CanonicalCompose {
+    name: String,
+    services: BTreeMap<String, CanonicalService>,
+}
+
+#[derive(Deserialize)]
+struct CanonicalService {
+    image: Option<String>,
+}
+
+pub async fn resolve_project(
+    project: &mut ProjectConfig,
+    runner: std::sync::Arc<dyn CommandRunner>,
+) -> anyhow::Result<()> {
+    let cwd = project.project_dir().to_path_buf();
+    let mut args = vec![
+        "compose".into(),
+        "--project-directory".into(),
+        cwd.display().to_string(),
+    ];
+    for file in &project.compose_files {
+        args.extend(["-f".into(), file.display().to_string()]);
+    }
+    args.extend(["config".into(), "--format".into(), "json".into()]);
+    let out = runner
+        .run("docker", &args, &cwd, project.command_timeout())
+        .await?;
+    if !out.success {
+        anyhow::bail!(
+            "无法解析 Compose 项目 {}\n{}",
+            project.compose_files[0].display(),
+            out.log
+        );
+    }
+    let canonical: CanonicalCompose = serde_json::from_str(&out.log)
+        .map_err(|error| anyhow::anyhow!("docker compose config 返回了无效 JSON: {error}"))?;
+    if canonical.name.trim().is_empty() {
+        anyhow::bail!("docker compose config 未返回项目名");
+    }
+
+    let mut services = Vec::new();
+    for (id, service) in canonical.services {
+        let Some(image) = service.image.filter(|image| !image.trim().is_empty()) else {
+            tracing::warn!(project=%canonical.name, service=%id, "忽略没有 image 的 Compose 服务");
+            continue;
+        };
+        services.push(service_from_image(id, image)?);
+    }
+    project.id = canonical.name;
+    project.services = services;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,20 +385,39 @@ mod tests {
             Ok(self.0.lock().unwrap().remove(0))
         }
     }
+
+    #[derive(Default)]
+    struct RecordingRunner(Mutex<Vec<(Vec<String>, PathBuf)>>);
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            args: &[String],
+            cwd: &Path,
+            _timeout_for: Duration,
+        ) -> anyhow::Result<CommandOutput> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((args.to_vec(), cwd.to_path_buf()));
+            Ok(CommandOutput {
+                success: true,
+                log: String::new(),
+            })
+        }
+    }
     #[tokio::test]
     async fn stable_override() {
         let d = tempdir().unwrap();
         let p = d.path().join("o.yaml");
         let s = ServiceConfig {
             id: "a".into(),
-            name: "A".into(),
             image: "ghcr.io/o/i".into(),
-            compose_service: "svc".into(),
             tag_pattern: ".*".into(),
-            version_source: crate::config::VersionSourceConfig::GithubPackages {
-                owner: "o".into(),
-                package: "p".into(),
-                owner_kind: crate::config::GithubOwnerKind::User,
+            version_source: crate::config::VersionSourceConfig::OciRegistry {
+                registry: "ghcr.io".into(),
+                repository: "o/i".into(),
             },
         };
         let mut v = BTreeMap::new();
@@ -367,11 +451,12 @@ mod tests {
             ),
         ])));
         let compose = Compose::new(
-            ComposeConfig {
-                project_name: "test".into(),
-                files: vec![compose_file],
+            ProjectConfig {
+                compose_files: vec![compose_file],
                 health_timeout_seconds: 1,
                 command_timeout_seconds: 1,
+                id: "test".into(),
+                services: Vec::new(),
             },
             dir.path().join("override.yaml"),
             runner,
@@ -396,6 +481,118 @@ mod tests {
                 .await
                 .container_status,
             "unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_compose_project_and_image_services() {
+        let dir = tempdir().unwrap();
+        let compose_file = dir.path().join("compose.yaml");
+        fs::write(&compose_file, "services: {}\n").await.unwrap();
+        let json = r#"{"name":"demo","services":{"api":{"image":"ghcr.io/me/api:1.2.3"},"local":{"build":{"context":"."}}}}"#;
+        let runner = Arc::new(FakeRunner(Mutex::new(vec![CommandOutput {
+            success: true,
+            log: json.into(),
+        }])));
+        let mut project = ProjectConfig {
+            compose_files: vec![compose_file],
+            health_timeout_seconds: 1,
+            command_timeout_seconds: 1,
+            id: String::new(),
+            services: Vec::new(),
+        };
+        resolve_project(&mut project, runner).await.unwrap();
+        assert_eq!(project.id, "demo");
+        assert_eq!(project.services.len(), 1);
+        assert_eq!(project.services[0].id, "api");
+        assert_eq!(project.services[0].image, "ghcr.io/me/api");
+    }
+
+    #[tokio::test]
+    async fn pull_targets_one_service_and_preserves_file_order_and_project_dir() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("compose.yaml");
+        let production = dir.path().join("compose.production.yaml");
+        fs::write(&base, "services: {}\n").await.unwrap();
+        fs::write(&production, "services: {}\n").await.unwrap();
+        let runner = Arc::new(RecordingRunner::default());
+        let compose = Compose::new(
+            ProjectConfig {
+                compose_files: vec![base.clone(), production.clone()],
+                health_timeout_seconds: 1,
+                command_timeout_seconds: 1,
+                id: "demo".into(),
+                services: Vec::new(),
+            },
+            dir.path().join("state/compose.deploy.yaml"),
+            runner.clone(),
+        );
+        compose.pull("api", Duration::from_secs(1)).await.unwrap();
+        let calls = runner.0.lock().unwrap();
+        let (args, cwd) = &calls[0];
+        assert_eq!(cwd, dir.path());
+        assert_eq!(args.last().unwrap(), "api");
+        assert_eq!(args[1..3], ["--project-name", "demo"]);
+        let base_at = args
+            .iter()
+            .position(|arg| arg == &base.display().to_string())
+            .unwrap();
+        let production_at = args
+            .iter()
+            .position(|arg| arg == &production.display().to_string())
+            .unwrap();
+        let override_at = args
+            .iter()
+            .position(|arg| arg.ends_with("compose.deploy.yaml"))
+            .unwrap();
+        assert!(base_at < production_at && production_at < override_at);
+        assert_eq!(args[args.len() - 2], "pull");
+    }
+
+    #[tokio::test]
+    async fn real_compose_keeps_first_file_as_relative_path_base_when_available() {
+        let available = std::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("compose.yaml");
+        let overlay = dir.path().join("compose.production.yaml");
+        fs::write(
+            &base,
+            "services:\n  api:\n    image: nginx:1.26\n    volumes:\n      - ./data:/data\n",
+        )
+        .await
+        .unwrap();
+        fs::write(&overlay, "services:\n  api:\n    image: nginx:1.27\n")
+            .await
+            .unwrap();
+        let args = vec![
+            "compose".into(),
+            "--project-directory".into(),
+            dir.path().display().to_string(),
+            "-f".into(),
+            base.display().to_string(),
+            "-f".into(),
+            overlay.display().to_string(),
+            "config".into(),
+            "--format".into(),
+            "json".into(),
+        ];
+        let output = ProcessRunner
+            .run("docker", &args, dir.path(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(output.success, "{}", output.log);
+        let value: serde_json::Value = serde_json::from_str(&output.log).unwrap();
+        assert_eq!(value["services"]["api"]["image"], "nginx:1.27");
+        assert_eq!(
+            value["services"]["api"]["volumes"][0]["source"],
+            dir.path().join("data").display().to_string()
         );
     }
 }

@@ -39,6 +39,11 @@ if ! getent group docker >/dev/null; then
   exit 1
 fi
 
+if ! docker compose version >/dev/null 2>&1; then
+  echo "Docker Compose v2 不可用，请先确保 docker compose version 可正常执行。" >&2
+  exit 1
+fi
+
 if ! getent group "${service_group}" >/dev/null; then
   groupadd --system "${service_group}"
 fi
@@ -67,11 +72,6 @@ else
   config_created=false
 fi
 
-if [[ ! -e "${config_dir}/github-token" ]]; then
-  install -o "${service_user}" -g "${service_group}" -m 0600 \
-    /dev/null "${config_dir}/github-token"
-fi
-
 systemctl daemon-reload
 systemctl enable "${service_name}.service"
 
@@ -82,7 +82,7 @@ if [[ "${config_created}" == true ]]; then
 else
   echo "1. 已保留现有配置：${config_dir}/config.yaml"
 fi
-echo "2. 私有 GitHub Packages 才需写入 Token：sudoedit ${config_dir}/github-token"
-echo "3. 私有镜像才需登录对应 Registry，例如：sudo -H -u ${service_user} docker login ghcr.io"
+echo "2. 确认 Compose 文件及其 .env/env_file 可由 ${service_user} 用户读取"
+echo "3. 公开 Docker Hub/GHCR 无需登录；需要认证时使用：sudo -H -u ${service_user} docker login ghcr.io"
 echo "4. 启动服务：sudo systemctl start ${service_name}"
 echo "5. 查看状态：systemctl status ${service_name}"

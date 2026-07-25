@@ -1,10 +1,7 @@
-use crate::{
-    config::{GithubOwnerKind, VersionSourceConfig},
-    error::AppError,
-};
+use crate::{config::VersionSourceConfig, error::AppError};
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use reqwest::{Client, RequestBuilder, StatusCode, header};
+use reqwest::{Client, StatusCode, header};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,23 +18,6 @@ pub struct PackageVersion {
     pub digest: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Deserialize)]
-struct GithubVersion {
-    id: i64,
-    name: String,
-    metadata: GithubMetadata,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-#[derive(Deserialize)]
-struct GithubMetadata {
-    container: GithubContainer,
-}
-#[derive(Deserialize)]
-struct GithubContainer {
-    tags: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -65,33 +45,18 @@ type Cache = Arc<RwLock<HashMap<String, (Instant, Vec<PackageVersion>)>>>;
 #[derive(Clone)]
 pub struct RegistryClient {
     client: Client,
-    github_api_base: String,
-    github_token: Option<String>,
     ttl: Duration,
     cache: Cache,
 }
 
 impl RegistryClient {
-    pub fn new(
-        github_api_base: String,
-        github_token: Option<String>,
-        ttl: Duration,
-    ) -> Result<Self, AppError> {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            "application/vnd.github+json".parse().unwrap(),
-        );
-        headers.insert("X-GitHub-Api-Version", "2022-11-28".parse().unwrap());
+    pub fn new(ttl: Duration) -> Result<Self, AppError> {
         let client = Client::builder()
             .user_agent("windplume-deploy/0.1")
-            .default_headers(headers)
             .build()
             .map_err(|e| AppError::Internal(e.to_string()))?;
         Ok(Self {
             client,
-            github_api_base: github_api_base.trim_end_matches('/').into(),
-            github_token,
             ttl,
             cache: Default::default(),
         })
@@ -112,11 +77,6 @@ impl RegistryClient {
         }
 
         let raw = match source {
-            VersionSourceConfig::GithubPackages {
-                owner,
-                package,
-                owner_kind,
-            } => self.github_versions(owner, package, *owner_kind).await?,
             VersionSourceConfig::DockerHub {
                 namespace,
                 repository,
@@ -135,66 +95,6 @@ impl RegistryClient {
             .await
             .insert(cache_key.into(), (Instant::now(), result.clone()));
         Ok(result)
-    }
-
-    async fn github_versions(
-        &self,
-        owner: &str,
-        package: &str,
-        owner_kind: GithubOwnerKind,
-    ) -> Result<Vec<RawVersion>, AppError> {
-        let owner_path = match owner_kind {
-            GithubOwnerKind::User => "users",
-            GithubOwnerKind::Organization => "orgs",
-        };
-        let mut page = 1;
-        let mut out = Vec::new();
-        loop {
-            let url = format!(
-                "{}/{}/{}/packages/container/{}/versions",
-                self.github_api_base, owner_path, owner, package
-            );
-            let request = self
-                .client
-                .get(url)
-                .query(&[("per_page", 100), ("page", page)]);
-            let response = self
-                .github_auth(request)
-                .send()
-                .await
-                .map_err(|e| AppError::Package(network_message("GitHub", &e)))?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let msg = match status {
-                    StatusCode::UNAUTHORIZED => "GitHub Token 无效",
-                    StatusCode::FORBIDDEN => "GitHub 拒绝访问或已限流",
-                    StatusCode::NOT_FOUND => "GitHub 包不存在、不是公开包或无权访问",
-                    _ => "GitHub API 请求失败",
-                };
-                return Err(AppError::Package(format!("{msg} ({status})")));
-            }
-            let batch: Vec<GithubVersion> = response
-                .json()
-                .await
-                .map_err(|_| AppError::Package("GitHub 返回了无效响应".into()))?;
-            let count = batch.len();
-            for item in batch {
-                for tag in item.metadata.container.tags {
-                    out.push(RawVersion {
-                        version: tag,
-                        source_id: item.id.to_string(),
-                        digest: Some(item.name.clone()).filter(|value| !value.is_empty()),
-                        created_at: Some(item.created_at),
-                        updated_at: Some(item.updated_at),
-                    });
-                }
-            }
-            if count < 100 {
-                break;
-            }
-            page += 1;
-        }
-        Ok(out)
     }
 
     async fn oci_versions(
@@ -282,13 +182,6 @@ impl RegistryClient {
                 updated_at: None,
             })
             .collect())
-    }
-
-    fn github_auth(&self, request: RequestBuilder) -> RequestBuilder {
-        match &self.github_token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
     }
 }
 

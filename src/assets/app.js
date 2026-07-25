@@ -1,6 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 let projects = [];
 let selected = null;
+let latestVersion = null;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -43,7 +44,7 @@ function badge(status) {
 function serviceCard(project, service) {
   return `<article class="card" data-project="${esc(project.id)}" data-service="${esc(service.id)}">
     <div class="card-head">
-      <div><h3>${esc(service.name)}</h3><span class="muted">${esc(service.compose_service)} · ${esc(service.version_source)}</span></div>
+      <div><h3>${esc(service.id)}</h3><span class="muted">${esc(service.version_source)}</span></div>
       ${badge(service.container_status)}
     </div>
     <div class="kv">
@@ -66,7 +67,7 @@ async function loadProjects() {
         .map(
           (project) => `<section class="project-block">
             <div class="project-head">
-              <div><h3>${esc(project.name)}</h3><p class="muted">${esc(project.compose_project_name)} · ${esc(project.compose_files.join(", "))}</p></div>
+              <div><h3>${esc(project.id)}</h3><p class="muted">${esc(project.compose_files.join(", "))}</p></div>
               ${project.deployment_in_progress ? badge("部署中") : ""}
             </div>
             <div class="cards">${project.services.map((service) => serviceCard(project, service)).join("")}</div>
@@ -87,13 +88,22 @@ async function selectService(projectId, serviceId, refresh = false) {
   if (!project || !service) return;
   selected = { project, service };
   $("#versions-section").hidden = false;
-  $("#versions-title").textContent = `${project.name} / ${service.name} · 可部署版本`;
+  $("#versions-title").textContent = `${project.id} / ${service.id} · 可部署版本`;
   $("#versions-source").textContent = `版本来源：${service.version_source}`;
   $("#versions").innerHTML = '<tr><td colspan="4">正在读取…</td></tr>';
+  latestVersion = null;
+  $("#deploy-latest").disabled = true;
   try {
     const data = await api(
       `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/versions?refresh=${refresh}`,
     );
+    latestVersion =
+      data.versions.find((item) => /^\d+\.\d+\.\d+$/.test(item.version))
+        ?.version || null;
+    $("#deploy-latest").disabled =
+      !latestVersion ||
+      project.deployment_in_progress ||
+      latestVersion === service.desired_version;
     $("#versions").innerHTML =
       data.versions
         .map(
@@ -116,7 +126,7 @@ async function selectService(projectId, serviceId, refresh = false) {
 function confirmDeploy(version) {
   const { project, service } = selected;
   $("#confirm-text").textContent =
-    `项目：${project.name}\n服务：${service.name}\n当前版本：${service.desired_version || "未部署"}\n目标版本：${version}`;
+    `项目：${project.id}\n服务：${service.id}\n当前版本：${service.desired_version || "未部署"}\n目标版本：${version}`;
   $("#confirm-go").onclick = async (event) => {
     event.preventDefault();
     $("#confirm-go").disabled = true;
@@ -211,6 +221,8 @@ async function showDetail(id) {
 $("#refresh").onclick = () =>
   selected &&
   selectService(selected.project.id, selected.service.id, true);
+$("#deploy-latest").onclick = () =>
+  latestVersion && confirmDeploy(latestVersion);
 $("#history-refresh").onclick = loadHistory;
 loadProjects();
 loadHistory();

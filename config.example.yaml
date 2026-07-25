@@ -1,35 +1,6 @@
-storage:
-  data_dir: /var/lib/windplume-deploy
-
 projects:
-  - id: windplume-cloud
-    name: Windplume Cloud
-    compose:
-      project_name: windplume-cloud
-      files:
-        - /opt/windplume/windplume-cloud/compose.yaml
-    services:
-      - id: identity
-        name: Identity Service
-        image: ghcr.io/ever-light/windplume-cloud-identity-service
-        compose_service: windplume-cloud-identity-service
-        version_source:
-          type: oci_registry
-          registry: ghcr.io
-          repository: ever-light/windplume-cloud-identity-service
+  - compose_files:
+      - /opt/windplume/windplume-cloud/compose.yaml
 
-  - id: windplume-web
-    name: Windplume Web
-    compose:
-      project_name: windplume-web
-      files:
-        - /opt/windplume/windplume-web/compose.yaml
-    services:
-      - id: web
-        name: Web
-        image: ghcr.io/ever-light/windplume-web
-        compose_service: windplume-web
-        version_source:
-          type: oci_registry
-          registry: ghcr.io
-          repository: ever-light/windplume-web
+  - compose_files:
+      - /opt/windplume/windplume-web/compose.yaml

@@ -166,16 +166,22 @@ async fn deploy_candidate(
     log.push_str(
         &runtime
             .compose
-            .up(&service.compose_service, project.compose.command_timeout())
+            .pull(&service.id, project.command_timeout())
+            .await?,
+    );
+    log.push_str(
+        &runtime
+            .compose
+            .up(&service.id, project.command_timeout())
             .await?,
     );
     log.push_str(
         &runtime
             .compose
             .wait_healthy(
-                &service.compose_service,
-                project.compose.health_timeout(),
-                project.compose.command_timeout(),
+                &service.id,
+                project.health_timeout(),
+                project.command_timeout(),
             )
             .await?,
     );
@@ -196,16 +202,16 @@ async fn rollback(
     log.push_str(
         &runtime
             .compose
-            .up(&service.compose_service, project.compose.command_timeout())
+            .up(&service.id, project.command_timeout())
             .await?,
     );
     log.push_str(
         &runtime
             .compose
             .wait_healthy(
-                &service.compose_service,
-                project.compose.health_timeout(),
-                project.compose.command_timeout(),
+                &service.id,
+                project.health_timeout(),
+                project.command_timeout(),
             )
             .await?,
     );
@@ -233,8 +239,8 @@ mod tests {
     use crate::{
         compose::{CommandOutput, CommandRunner, Compose},
         config::{
-            ComposeConfig, Config, GithubOwnerKind, ProjectConfig, RegistryConfig, ServerConfig,
-            ServiceConfig, StorageConfig, VersionSourceConfig,
+            Config, ProjectConfig, RegistryConfig, ServerConfig, ServiceConfig, StorageConfig,
+            VersionSourceConfig,
         },
         registry::RegistryClient,
         state::ProjectRuntime,
@@ -272,25 +278,18 @@ mod tests {
             .unwrap();
         let service = ServiceConfig {
             id: "identity".into(),
-            name: "Identity".into(),
             image: "ghcr.io/owner/identity".into(),
-            compose_service: "identity-service".into(),
             tag_pattern: r"^\d+\.\d+\.\d+$".into(),
-            version_source: VersionSourceConfig::GithubPackages {
-                owner: "owner".into(),
-                package: "identity".into(),
-                owner_kind: GithubOwnerKind::User,
+            version_source: VersionSourceConfig::OciRegistry {
+                registry: "ghcr.io".into(),
+                repository: "owner/identity".into(),
             },
         };
         let project = ProjectConfig {
+            compose_files: vec![compose_file],
+            health_timeout_seconds: 1,
+            command_timeout_seconds: 1,
             id: "app".into(),
-            name: "App".into(),
-            compose: ComposeConfig {
-                project_name: "test".into(),
-                files: vec![compose_file],
-                health_timeout_seconds: 1,
-                command_timeout_seconds: 1,
-            },
             services: vec![service.clone()],
         };
         let config = Arc::new(Config {
@@ -306,13 +305,11 @@ mod tests {
             projects: vec![project.clone()],
         });
         let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
-        let registry =
-            RegistryClient::new("http://127.0.0.1:1".into(), None, Duration::from_secs(60))
-                .unwrap();
+        let registry = RegistryClient::new(Duration::from_secs(60)).unwrap();
         let override_file = dir.path().join("override.yaml");
         let runtime = ProjectRuntime {
             compose: Compose::new(
-                project.compose.clone(),
+                project.clone(),
                 override_file.clone(),
                 Arc::new(FakeRunner(Mutex::new(outputs))),
             ),
@@ -361,6 +358,7 @@ mod tests {
         let (state, project, service) = state(
             &dir,
             vec![
+                output(true, "pull"),
                 output(true, "up"),
                 output(true, "container\n"),
                 output(true, inspect),

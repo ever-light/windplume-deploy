@@ -36,8 +36,6 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
 #[derive(Serialize)]
 struct ProjectView {
     id: String,
-    name: String,
-    compose_project_name: String,
     compose_files: Vec<String>,
     deployment_in_progress: bool,
     services: Vec<ServiceView>,
@@ -46,8 +44,6 @@ struct ProjectView {
 #[derive(Serialize)]
 struct ServiceView {
     id: String,
-    name: String,
-    compose_service: String,
     image: String,
     version_source: &'static str,
     desired_version: Option<String>,
@@ -70,8 +66,8 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
             let actual = runtime
                 .compose
                 .runtime(
-                    &service.compose_service,
-                    std::time::Duration::from_secs(15).min(project.compose.command_timeout()),
+                    &service.id,
+                    std::time::Duration::from_secs(15).min(project.command_timeout()),
                 )
                 .await;
             let desired_image = desired.as_ref().map(|item| item.image.clone());
@@ -82,8 +78,6 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
             };
             services.push(ServiceView {
                 id: service.id.clone(),
-                name: service.name.clone(),
-                compose_service: service.compose_service.clone(),
                 image: service.image.clone(),
                 version_source: service.version_source.kind(),
                 desired_version: desired.map(|item| item.desired_version),
@@ -95,11 +89,8 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
         }
         out.push(ProjectView {
             id: project.id.clone(),
-            name: project.name.clone(),
-            compose_project_name: project.compose.project_name.clone(),
             compose_files: project
-                .compose
-                .files
+                .compose_files
                 .iter()
                 .map(|file| file.display().to_string())
                 .collect(),
@@ -215,9 +206,7 @@ mod tests {
     use super::*;
     use crate::{
         compose::{Compose, ProcessRunner},
-        config::{
-            ComposeConfig, Config, ProjectConfig, RegistryConfig, ServerConfig, StorageConfig,
-        },
+        config::{Config, ProjectConfig, RegistryConfig, ServerConfig, StorageConfig},
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
@@ -233,14 +222,10 @@ mod tests {
             .await
             .unwrap();
         let project = ProjectConfig {
+            compose_files: vec![compose_file],
+            health_timeout_seconds: 1,
+            command_timeout_seconds: 1,
             id: "app".into(),
-            name: "App".into(),
-            compose: ComposeConfig {
-                project_name: "app".into(),
-                files: vec![compose_file],
-                health_timeout_seconds: 1,
-                command_timeout_seconds: 1,
-            },
             services: Vec::new(),
         };
         let config = Arc::new(Config {
@@ -256,16 +241,10 @@ mod tests {
             projects: vec![project.clone()],
         });
         let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
-        let registry =
-            RegistryClient::new("http://127.0.0.1:1".into(), None, Duration::from_secs(60))
-                .unwrap();
+        let registry = RegistryClient::new(Duration::from_secs(60)).unwrap();
         let override_file = dir.path().join("override.yaml");
         let runtime = ProjectRuntime {
-            compose: Compose::new(
-                project.compose,
-                override_file.clone(),
-                Arc::new(ProcessRunner),
-            ),
+            compose: Compose::new(project, override_file.clone(), Arc::new(ProcessRunner)),
             override_file,
             deploy_lock: Arc::new(Semaphore::new(1)),
         };
