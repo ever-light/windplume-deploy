@@ -107,8 +107,9 @@ sudo systemctl start windplume-deploy
 ```
 
 安装脚本创建 `windplume-deploy` 系统用户，将其加入 `docker` 组，安装文件并启用
-systemd 服务，但不会在配置完成前启动服务。Compose 文件、`.env` 和 `env_file`
-必须允许该服务用户读取。
+systemd 服务，但不会在配置完成前启动服务。脚本会将 `/opt/windplume` 目录树的组
+设为 `windplume-deploy`，授予组读取和目录进入权限，并对目录设置 setgid，使以后
+创建的项目继续继承该组。Compose 文件、`.env` 和 `env_file` 因此可由服务读取。
 
 公开 Docker Hub 和公开 GHCR 的 tag 查询及镜像拉取通常不需要 Token。如果
 Docker 拉取需要认证，请使用服务用户登录；GitHub PAT 作为密码输入，凭据由

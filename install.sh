@@ -6,6 +6,7 @@ service_user="windplume-deploy"
 service_group="windplume-deploy"
 config_dir="/etc/windplume-deploy"
 data_dir="/var/lib/windplume-deploy"
+project_root="/opt/windplume"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -27,7 +28,7 @@ for source_file in "${binary_source}" "${config_source}" "${unit_source}"; do
   fi
 done
 
-for command_name in docker getent groupadd id install systemctl useradd usermod; do
+for command_name in chgrp chmod docker find getent groupadd id install systemctl useradd usermod; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "缺少必要命令：${command_name}" >&2
     exit 1
@@ -61,6 +62,17 @@ usermod --append --groups docker "${service_user}"
 
 install -d -o root -g "${service_group}" -m 0750 "${config_dir}"
 install -d -o "${service_user}" -g "${service_group}" -m 0750 "${data_dir}"
+
+# Compose 项目默认部署在这里。服务需要遍历目录并读取 Compose、.env 和
+# env_file；目录上的 setgid 可让之后创建的内容继续继承服务组。
+if [[ -d "${project_root}" ]]; then
+  chgrp -R "${service_group}" "${project_root}"
+  chmod -R g+rX "${project_root}"
+  find "${project_root}" -type d -exec chmod g+s {} +
+else
+  install -d -o root -g "${service_group}" -m 2750 "${project_root}"
+fi
+
 install -o root -g root -m 0755 "${binary_source}" "/usr/local/bin/${service_name}"
 install -o root -g root -m 0644 "${unit_source}" "/etc/systemd/system/${service_name}.service"
 
@@ -82,7 +94,7 @@ if [[ "${config_created}" == true ]]; then
 else
   echo "1. 已保留现有配置：${config_dir}/config.yaml"
 fi
-echo "2. 确认 Compose 文件及其 .env/env_file 可由 ${service_user} 用户读取"
+echo "2. ${project_root} 已配置为可由 ${service_user} 用户读取"
 echo "3. 公开 Docker Hub/GHCR 无需登录；需要认证时使用：sudo -H -u ${service_user} docker login ghcr.io"
 echo "4. 启动服务：sudo systemctl start ${service_name}"
 echo "5. 查看状态：systemctl status ${service_name}"
