@@ -125,7 +125,16 @@ async fn versions(
             &service.tag_pattern,
             query.refresh,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                project_id = %project_id,
+                service_id = %service_id,
+                error = %error,
+                "registry version query failed"
+            );
+            error
+        })?;
     Ok(Json(serde_json::json!({
         "project_id": project_id,
         "service_id": service_id,

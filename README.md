@@ -112,12 +112,18 @@ systemd 服务，但不会在配置完成前启动服务。脚本会将 `/opt/wi
 创建的项目继续继承该组。Compose 文件、`.env` 和 `env_file` 因此可由服务读取。
 
 公开 Docker Hub 和公开 GHCR 的 tag 查询及镜像拉取通常不需要 Token。如果
-Docker 拉取需要认证，请使用服务用户登录；GitHub PAT 作为密码输入，凭据由
-Docker 管理：
+Registry 需要认证，请使用服务用户登录；服务会从该用户的 Docker 配置中读取
+内联登录凭据用于 tag 查询，镜像拉取也由 Docker 使用同一份凭据。GHCR 私有包
+需要具有 `read:packages` 权限的 classic PAT，PAT 作为密码输入：
 
 ```bash
 sudo -H -u windplume-deploy docker login ghcr.io -u YOUR_GITHUB_USERNAME
 ```
+
+安装的 systemd unit 将 Docker 配置目录固定为
+`/var/lib/windplume-deploy/.docker`。若 `docker login` 使用系统 credential helper
+而非在 `config.json` 中保存内联 `auth`，当前版本的 tag 查询无法读取该凭据；可为
+此服务使用不配置 credential helper 的独立 Docker 配置。
 
 该服务用户能访问 Docker socket，主机权限实际上接近 root，只应把网页开放在
 可信内网。若监听 `0.0.0.0`，应同时配置防火墙或带认证的反向代理。

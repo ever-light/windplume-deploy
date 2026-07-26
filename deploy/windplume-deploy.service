@@ -12,6 +12,8 @@ WorkingDirectory=/var/lib/windplume-deploy
 ExecStart=/usr/local/bin/windplume-deploy --config /etc/windplume-deploy/config.yaml
 Restart=on-failure
 RestartSec=5s
+Environment=HOME=/var/lib/windplume-deploy
+Environment=DOCKER_CONFIG=/var/lib/windplume-deploy/.docker
 Environment=RUST_LOG=windplume_deploy=info,tower_http=info
 
 [Install]

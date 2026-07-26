@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 let projects = [];
 let selected = null;
 let latestVersion = null;
+let diagnostics = [];
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -33,6 +34,14 @@ function toast(message) {
   setTimeout(() => (element.style.display = "none"), 4000);
 }
 
+function diagnose(scope, message) {
+  diagnostics.unshift({ at: new Date(), scope, message });
+  diagnostics = diagnostics.slice(0, 100);
+  $("#diagnostics").textContent = diagnostics
+    .map((item) => `[${item.at.toLocaleString()}] ${item.scope}: ${item.message}`)
+    .join("\n");
+}
+
 function badge(status) {
   const ok = ["healthy", "running", "succeeded"].includes(status);
   const bad = ["unhealthy", "failed", "exited", "dead", "interrupted"].includes(
@@ -42,6 +51,9 @@ function badge(status) {
 }
 
 function serviceCard(project, service) {
+  const consistency = !service.desired_image
+    ? '<span class="muted">未建立部署基线</span>'
+    : `<span class="${service.drift ? "drift" : ""}">${service.drift ? "存在 drift" : "一致"}</span>`;
   return `<article class="card" data-project="${esc(project.id)}" data-service="${esc(service.id)}">
     <div class="card-head">
       <div><h3>${esc(service.id)}</h3><span class="muted">${esc(service.version_source)}</span></div>
@@ -51,7 +63,7 @@ function serviceCard(project, service) {
       <span>期望版本</span><strong>${esc(service.desired_version)}</strong>
       <span>期望镜像</span><code>${esc(service.desired_image)}</code>
       <span>实际镜像</span><code>${esc(service.actual_image)}</code>
-      <span>一致性</span><span class="${service.drift ? "drift" : ""}">${service.drift ? "存在 drift" : "一致"}</span>
+      <span>一致性</span>${consistency}
     </div>
   </article>`;
 }
@@ -78,6 +90,7 @@ async function loadProjects() {
       card.onclick = () => selectService(card.dataset.project, card.dataset.service);
     });
   } catch (error) {
+    diagnose("项目状态", error.message);
     $("#projects").innerHTML = `<p class="drift">${esc(error.message)}</p>`;
   }
 }
@@ -119,6 +132,7 @@ async function selectService(projectId, serviceId, refresh = false) {
       button.onclick = () => confirmDeploy(button.dataset.version);
     });
   } catch (error) {
+    diagnose(`${projectId} / ${serviceId} 版本查询`, error.message);
     $("#versions").innerHTML = `<tr><td colspan="4" class="drift">${esc(error.message)}</td></tr>`;
   }
 }
@@ -143,6 +157,7 @@ function confirmDeploy(version) {
       toast(`任务 ${deployment.deployment_id} 已创建`);
       await poll(deployment.deployment_id);
     } catch (error) {
+      diagnose(`${project.id} / ${service.id} 创建部署`, error.message);
       toast(error.message);
     } finally {
       $("#confirm-go").disabled = false;
@@ -170,6 +185,7 @@ async function poll(id) {
         return;
       }
     } catch (error) {
+      diagnose(`部署任务 ${id}`, error.message);
       toast(error.message);
     }
   }
@@ -201,6 +217,7 @@ async function loadHistory() {
       row.onclick = () => showDetail(row.dataset.id);
     });
   } catch (error) {
+    diagnose("部署历史", error.message);
     toast(error.message);
   }
 }
@@ -214,6 +231,7 @@ async function showDetail(id) {
     $("#detail-log").textContent = deployment.command_log || "（无日志）";
     $("#detail").showModal();
   } catch (error) {
+    diagnose(`部署详情 ${id}`, error.message);
     toast(error.message);
   }
 }
@@ -224,6 +242,10 @@ $("#refresh").onclick = () =>
 $("#deploy-latest").onclick = () =>
   latestVersion && confirmDeploy(latestVersion);
 $("#history-refresh").onclick = loadHistory;
+$("#diagnostics-clear").onclick = () => {
+  diagnostics = [];
+  $("#diagnostics").textContent = "（暂无诊断信息）";
+};
 loadProjects();
 loadHistory();
 setInterval(() => {
