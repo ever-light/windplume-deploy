@@ -8,6 +8,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+const CONTAINER_LOG_TAIL: u32 = 200;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -19,6 +21,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/projects/{project_id}/services/{service_id}/deploy",
             post(deploy),
+        )
+        .route(
+            "/api/projects/{project_id}/services/{service_id}/logs",
+            get(service_logs),
         )
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
@@ -165,6 +171,49 @@ async fn deploy(
     ))
 }
 
+async fn service_logs(
+    State(state): State<AppState>,
+    Path((project_id, service_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .config
+        .project(&project_id)
+        .ok_or(AppError::NotFound)?;
+    if !project
+        .services
+        .iter()
+        .any(|service| service.id == service_id)
+    {
+        return Err(AppError::NotFound);
+    }
+    let runtime = state
+        .project_runtime(&project_id)
+        .ok_or_else(|| AppError::Internal("未找到 Compose 项目运行时".into()))?;
+    let logs = runtime
+        .compose
+        .logs(
+            &service_id,
+            CONTAINER_LOG_TAIL,
+            std::time::Duration::from_secs(30).min(project.command_timeout()),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                project_id = %project_id,
+                service_id = %service_id,
+                error = %error,
+                "container log query failed"
+            );
+            AppError::Internal(error.to_string())
+        })?;
+    Ok(Json(serde_json::json!({
+        "project_id": project_id,
+        "service_id": service_id,
+        "tail": CONTAINER_LOG_TAIL,
+        "logs": logs
+    })))
+}
+
 #[derive(Default, Deserialize)]
 struct HistoryQuery {
     limit: Option<u32>,
@@ -295,6 +344,7 @@ mod tests {
         );
 
         let rejected = app
+            .clone()
             .oneshot(
                 Request::post("/api/projects/app/services/missing/deploy")
                     .header(header::CONTENT_TYPE, "text/plain")
@@ -305,5 +355,15 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
         assert_eq!(rejected.headers()[header::CONTENT_TYPE], "application/json");
+
+        let missing_logs = app
+            .oneshot(
+                Request::get("/api/projects/app/services/missing/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_logs.status(), StatusCode::NOT_FOUND);
     }
 }

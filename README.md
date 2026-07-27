@@ -90,6 +90,10 @@ services:
 
 程序不会改写原始 Compose、`.env`、`env_file` 或业务目录。
 
+每个服务卡片提供“查看日志”按钮，按需执行
+`docker compose logs --no-color --tail 200 <service>` 并显示最近 200 行。
+该功能不会持续跟踪或存储容器日志。
+
 ## 构建与安装
 
 需要 Rust 1.96 或更新版本、Docker 和 Docker Compose v2：

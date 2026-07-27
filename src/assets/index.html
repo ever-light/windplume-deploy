@@ -6,4 +6,5 @@
 <section><div class="section-head"><div><h2>页面诊断日志</h2><p class="muted">记录本次页面会话中的接口错误；服务端日志仍可通过 journalctl 查看</p></div><button id="diagnostics-clear">清空</button></div><pre id="diagnostics">（暂无诊断信息）</pre></section></main>
 <dialog id="confirm"><form method="dialog"><h2>确认部署</h2><p id="confirm-text"></p><div class="actions"><button value="cancel">取消</button><button id="confirm-go" value="default" class="primary">开始部署</button></div></form></dialog>
 <dialog id="detail"><form method="dialog"><h2>部署详情</h2><p id="detail-summary"></p><pre id="detail-log"></pre><div class="actions"><button>关闭</button></div></form></dialog>
+<dialog id="container-logs"><form method="dialog"><h2>容器日志</h2><p id="container-logs-summary" class="muted"></p><pre id="container-logs-content">正在读取…</pre><div class="actions"><button>关闭</button></div></form></dialog>
 <div id="toast" role="status"></div><script src="/assets/app.js"></script></body></html>

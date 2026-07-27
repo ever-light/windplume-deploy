@@ -65,6 +65,7 @@ function serviceCard(project, service) {
       <span>实际镜像</span><code>${esc(service.actual_image)}</code>
       <span>一致性</span>${consistency}
     </div>
+    <div class="actions" style="justify-content:flex-end;margin-top:14px"><button class="service-logs" data-project="${esc(project.id)}" data-service="${esc(service.id)}">查看日志</button></div>
   </article>`;
 }
 
@@ -88,6 +89,12 @@ async function loadProjects() {
         .join("") || '<p class="muted">没有配置 Compose 项目</p>';
     document.querySelectorAll(".card").forEach((card) => {
       card.onclick = () => selectService(card.dataset.project, card.dataset.service);
+    });
+    document.querySelectorAll(".service-logs").forEach((button) => {
+      button.onclick = (event) => {
+        event.stopPropagation();
+        showContainerLogs(button.dataset.project, button.dataset.service);
+      };
     });
   } catch (error) {
     diagnose("项目状态", error.message);
@@ -233,6 +240,24 @@ async function showDetail(id) {
   } catch (error) {
     diagnose(`部署详情 ${id}`, error.message);
     toast(error.message);
+  }
+}
+
+async function showContainerLogs(projectId, serviceId) {
+  $("#container-logs-summary").textContent =
+    `${projectId} / ${serviceId} · 最近 200 行`;
+  $("#container-logs-content").textContent = "正在读取…";
+  $("#container-logs").showModal();
+  try {
+    const data = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/logs`,
+    );
+    $("#container-logs-summary").textContent =
+      `${projectId} / ${serviceId} · 最近 ${data.tail} 行`;
+    $("#container-logs-content").textContent = data.logs || "（暂无日志）";
+  } catch (error) {
+    diagnose(`${projectId} / ${serviceId} 容器日志`, error.message);
+    $("#container-logs-content").textContent = `读取失败：${error.message}`;
   }
 }
 

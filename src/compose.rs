@@ -192,6 +192,21 @@ impl Compose {
         }
         Ok(out.log)
     }
+    pub async fn logs(&self, service: &str, tail: u32, limit: Duration) -> anyhow::Result<String> {
+        let mut args = self.base_args();
+        args.extend([
+            "logs".into(),
+            "--no-color".into(),
+            "--tail".into(),
+            tail.to_string(),
+            service.into(),
+        ]);
+        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose logs 执行失败\n{}", out.log);
+        }
+        Ok(out.log)
+    }
     async fn ids(&self, service: &str, limit: Duration) -> anyhow::Result<(Vec<String>, String)> {
         let mut args = self.base_args();
         args.extend(["ps".into(), "-q".into(), service.into()]);
@@ -509,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_targets_one_service_and_preserves_file_order_and_project_dir() {
+    async fn service_commands_preserve_file_order_project_dir_and_log_tail() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("compose.yaml");
         let production = dir.path().join("compose.production.yaml");
@@ -528,6 +543,10 @@ mod tests {
             runner.clone(),
         );
         compose.pull("api", Duration::from_secs(1)).await.unwrap();
+        compose
+            .logs("api", 200, Duration::from_secs(1))
+            .await
+            .unwrap();
         let calls = runner.0.lock().unwrap();
         let (args, cwd) = &calls[0];
         assert_eq!(cwd, dir.path());
@@ -547,6 +566,12 @@ mod tests {
             .unwrap();
         assert!(base_at < production_at && production_at < override_at);
         assert_eq!(args[args.len() - 2], "pull");
+        let (log_args, log_cwd) = &calls[1];
+        assert_eq!(log_cwd, dir.path());
+        assert_eq!(
+            &log_args[log_args.len() - 5..],
+            ["logs", "--no-color", "--tail", "200", "api"]
+        );
     }
 
     #[tokio::test]
