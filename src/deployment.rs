@@ -6,7 +6,7 @@ use crate::{
     storage::Deployment,
 };
 use chrono::Utc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -16,22 +16,22 @@ pub async fn enqueue(
     service_id: &str,
     version: &str,
 ) -> Result<Deployment, AppError> {
-    let project = state
-        .config
-        .project(project_id)
+    let runtime = state
+        .project_runtime(project_id)
         .cloned()
         .ok_or(AppError::NotFound)?;
+    let permit = runtime
+        .deploy_lock
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
+    let project = runtime.compose.project();
     let service = project
         .services
         .iter()
         .find(|service| service.id == service_id)
         .cloned()
         .ok_or(AppError::NotFound)?;
-    let runtime = state
-        .project_runtime(project_id)
-        .cloned()
-        .ok_or(AppError::NotFound)?;
-
     let regex = regex::Regex::new(&service.tag_pattern)
         .map_err(|error| AppError::Internal(error.to_string()))?;
     if !regex.is_match(version) {
@@ -53,11 +53,6 @@ pub async fn enqueue(
         return Err(AppError::VersionNotFound(version.into()));
     }
 
-    let permit = runtime
-        .deploy_lock
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::Busy)?;
     let old = state.storage.state(project_id, service_id).await?;
     let item = Deployment {
         id: Uuid::new_v4().to_string(),
@@ -82,13 +77,19 @@ pub async fn enqueue(
 
 async fn versions_from_db(
     state: &AppState,
-    project_id: &str,
+    project: &ProjectConfig,
 ) -> anyhow::Result<BTreeMap<String, String>> {
+    let managed = project
+        .services
+        .iter()
+        .map(|service| service.id.as_str())
+        .collect::<HashSet<_>>();
     Ok(state
         .storage
-        .states(project_id)
+        .states(&project.id)
         .await?
         .into_iter()
+        .filter(|state| managed.contains(state.service_id.as_str()))
         .map(|state| (state.service_id, state.desired_version))
         .collect())
 }
@@ -160,7 +161,7 @@ async fn deploy_candidate(
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let mut versions = versions_from_db(state, &project.id).await?;
+    let mut versions = versions_from_db(state, project).await?;
     versions.insert(service.id.clone(), version.into());
     write_override(&runtime.override_file, &project.services, &versions).await?;
     log.push_str(
@@ -197,7 +198,7 @@ async fn rollback(
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let versions = versions_from_db(state, &project.id).await?;
+    let versions = versions_from_db(state, project).await?;
     write_override(&runtime.override_file, &project.services, &versions).await?;
     log.push_str(
         &runtime
@@ -218,17 +219,23 @@ async fn rollback(
     Ok(())
 }
 
-async fn rebuild_project_override(state: &AppState, project: &ProjectConfig) -> anyhow::Result<()> {
+pub async fn rebuild_project_override(
+    state: &AppState,
+    project: &ProjectConfig,
+) -> anyhow::Result<()> {
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let versions = versions_from_db(state, &project.id).await?;
+    let versions = versions_from_db(state, project).await?;
     write_override(&runtime.override_file, &project.services, &versions).await
 }
 
 pub async fn rebuild_override(state: &AppState) -> anyhow::Result<()> {
     for project in &state.config.projects {
-        rebuild_project_override(state, project).await?;
+        let runtime = state
+            .project_runtime(&project.id)
+            .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
+        rebuild_project_override(state, &runtime.compose.project()).await?;
     }
     Ok(())
 }
@@ -427,5 +434,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn removed_service_state_is_preserved_but_excluded_from_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut project, service) = state(&dir, Vec::new()).await;
+        let item = queued();
+        state.storage.create_deployment(&item).await.unwrap();
+        state
+            .storage
+            .finish_success(
+                &item.id,
+                "app",
+                &service.id,
+                "1.2.3",
+                "ghcr.io/owner/identity:1.2.3",
+                "ok",
+            )
+            .await
+            .unwrap();
+        project.services = vec![ServiceConfig {
+            id: "replacement".into(),
+            image: "nginx".into(),
+            tag_pattern: "^.+$".into(),
+            version_source: VersionSourceConfig::DockerHub {
+                namespace: "library".into(),
+                repository: "nginx".into(),
+            },
+        }];
+
+        rebuild_project_override(&state, &project).await.unwrap();
+
+        assert!(
+            state
+                .storage
+                .state("app", "identity")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let override_file = &state.project_runtime("app").unwrap().override_file;
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&tokio::fs::read_to_string(override_file).await.unwrap()).unwrap();
+        assert!(yaml["services"].as_mapping().unwrap().is_empty());
     }
 }

@@ -26,6 +26,10 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{project_id}/services/{service_id}/logs",
             get(service_logs),
         )
+        .route(
+            "/api/projects/{project_id}/refresh-compose",
+            post(refresh_compose),
+        )
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
         .route("/", get(index))
@@ -61,10 +65,11 @@ struct ServiceView {
 
 async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>>, AppError> {
     let mut out = Vec::new();
-    for project in &state.config.projects {
+    for configured_project in &state.config.projects {
         let runtime = state
-            .project_runtime(&project.id)
+            .project_runtime(&configured_project.id)
             .ok_or_else(|| AppError::Internal("Compose 项目运行时不存在".into()))?;
+        let project = runtime.compose.project();
         let busy = runtime.deploy_lock.available_permits() == 0;
         let mut services = Vec::new();
         for service in &project.services {
@@ -118,9 +123,14 @@ async fn versions(
     Path((project_id, service_id)): Path<(String, String)>,
     Query(query): Query<VersionQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let service = state
-        .config
-        .service(&project_id, &service_id)
+    let runtime = state
+        .project_runtime(&project_id)
+        .ok_or(AppError::NotFound)?;
+    let project = runtime.compose.project();
+    let service = project
+        .services
+        .iter()
+        .find(|service| service.id == service_id)
         .ok_or(AppError::NotFound)?;
     let cache_key = format!("{project_id}/{service_id}");
     let versions = state
@@ -175,10 +185,10 @@ async fn service_logs(
     State(state): State<AppState>,
     Path((project_id, service_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let project = state
-        .config
-        .project(&project_id)
+    let runtime = state
+        .project_runtime(&project_id)
         .ok_or(AppError::NotFound)?;
+    let project = runtime.compose.project();
     if !project
         .services
         .iter()
@@ -186,9 +196,6 @@ async fn service_logs(
     {
         return Err(AppError::NotFound);
     }
-    let runtime = state
-        .project_runtime(&project_id)
-        .ok_or_else(|| AppError::Internal("未找到 Compose 项目运行时".into()))?;
     let logs = runtime
         .compose
         .logs(
@@ -211,6 +218,49 @@ async fn service_logs(
         "service_id": service_id,
         "tail": CONTAINER_LOG_TAIL,
         "logs": logs
+    })))
+}
+
+async fn refresh_compose(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let runtime = state
+        .project_runtime(&project_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let _permit = runtime
+        .deploy_lock
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
+    let current = runtime.compose.project();
+    let candidate = runtime
+        .compose
+        .resolve_candidate()
+        .await
+        .map_err(|error| AppError::Invalid(error.to_string()))?;
+    if candidate.id != current.id {
+        return Err(AppError::Invalid(format!(
+            "Compose 项目名从 {} 变为 {}，请重启服务处理项目身份变化",
+            current.id, candidate.id
+        )));
+    }
+    if candidate.services.is_empty() {
+        return Err(AppError::Invalid(
+            "Compose 项目没有可管理的 image 服务".into(),
+        ));
+    }
+
+    deployment::rebuild_project_override(&state, &candidate)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let service_count = candidate.services.len();
+    runtime.compose.replace_project(candidate);
+    state.registry.invalidate_project(&project_id).await;
+    Ok(Json(serde_json::json!({
+        "project_id": project_id,
+        "service_count": service_count
     })))
 }
 
@@ -263,16 +313,45 @@ async fn css() -> impl IntoResponse {
 mod tests {
     use super::*;
     use crate::{
-        compose::{Compose, ProcessRunner},
-        config::{Config, ProjectConfig, RegistryConfig, ServerConfig, StorageConfig},
+        compose::{CommandOutput, CommandRunner, Compose, ProcessRunner},
+        config::{
+            Config, ProjectConfig, RegistryConfig, ServerConfig, StorageConfig, service_from_image,
+        },
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
     };
-    use axum::{body::Body, http::Request};
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use std::{
+        collections::HashMap,
+        path::Path,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::sync::Semaphore;
     use tower::ServiceExt;
+
+    struct FakeRunner {
+        outputs: Mutex<Vec<CommandOutput>>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for FakeRunner {
+        async fn run(
+            &self,
+            _program: &str,
+            args: &[String],
+            _cwd: &Path,
+            _timeout_for: Duration,
+        ) -> anyhow::Result<CommandOutput> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            Ok(self.outputs.lock().unwrap().remove(0))
+        }
+    }
 
     async fn app(dir: &tempfile::TempDir) -> Router {
         let compose_file = dir.path().join("compose.yaml");
@@ -314,6 +393,55 @@ mod tests {
         })
     }
 
+    async fn refresh_state(
+        dir: &tempfile::TempDir,
+        outputs: Vec<CommandOutput>,
+    ) -> (AppState, Arc<FakeRunner>) {
+        let compose_file = dir.path().join("compose.yaml");
+        tokio::fs::write(&compose_file, "services: {}\n")
+            .await
+            .unwrap();
+        let project = ProjectConfig {
+            compose_files: vec![compose_file],
+            health_timeout_seconds: 1,
+            command_timeout_seconds: 1,
+            id: "app".into(),
+            services: vec![service_from_image("old".into(), "nginx:1.0.0".into()).unwrap()],
+        };
+        let config = Arc::new(Config {
+            server: ServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+            },
+            registries: RegistryConfig::default(),
+            storage: StorageConfig {
+                data_dir: dir.path().into(),
+                history_limit: 10,
+                max_log_bytes: 1024,
+            },
+            projects: vec![project.clone()],
+        });
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        let runner = Arc::new(FakeRunner {
+            outputs: Mutex::new(outputs),
+            calls: Mutex::new(Vec::new()),
+        });
+        let override_file = dir.path().join("override.yaml");
+        let runtime = ProjectRuntime {
+            compose: Compose::new(project, override_file.clone(), runner.clone()),
+            override_file,
+            deploy_lock: Arc::new(Semaphore::new(1)),
+        };
+        (
+            AppState {
+                config,
+                storage,
+                registry: RegistryClient::new(Duration::from_secs(60)).unwrap(),
+                projects: Arc::new(HashMap::from([("app".into(), runtime)])),
+            },
+            runner,
+        )
+    }
+
     #[tokio::test]
     async fn health_projects_static_assets_and_json_rejection_work() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,6 +471,21 @@ mod tests {
             "text/javascript; charset=utf-8"
         );
 
+        let css = app
+            .clone()
+            .oneshot(Request::get("/assets/app.css").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let css = String::from_utf8(
+            to_bytes(css.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(css.contains("width:min(61.8vw,1180px)"));
+        assert!(css.contains("#container-logs-content{height:55vh"));
+
         let rejected = app
             .clone()
             .oneshot(
@@ -365,5 +508,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_logs.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refresh_updates_snapshot_rejects_name_change_and_respects_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let outputs = vec![
+            CommandOutput {
+                success: true,
+                log: r#"{"name":"app","services":{"api":{"image":"ghcr.io/me/api:2.0.0"}}}"#.into(),
+            },
+            CommandOutput {
+                success: true,
+                log: r#"{"name":"renamed","services":{"api":{"image":"ghcr.io/me/api:2.0.0"}}}"#
+                    .into(),
+            },
+            CommandOutput {
+                success: false,
+                log: "invalid compose".into(),
+            },
+        ];
+        let (state, runner) = refresh_state(&dir, outputs).await;
+
+        let refreshed = refresh_compose(State(state.clone()), Path("app".into()))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.0["service_count"], 1);
+        let project = state.project_runtime("app").unwrap().compose.project();
+        assert_eq!(project.services[0].id, "api");
+
+        let renamed = refresh_compose(State(state.clone()), Path("app".into())).await;
+        assert!(matches!(renamed, Err(AppError::Invalid(_))));
+        assert_eq!(
+            state.project_runtime("app").unwrap().compose.project().id,
+            "app"
+        );
+
+        let invalid = refresh_compose(State(state.clone()), Path("app".into())).await;
+        assert!(matches!(invalid, Err(AppError::Invalid(_))));
+        assert_eq!(
+            state
+                .project_runtime("app")
+                .unwrap()
+                .compose
+                .project()
+                .services[0]
+                .id,
+            "api"
+        );
+
+        let permit = state
+            .project_runtime("app")
+            .unwrap()
+            .deploy_lock
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let busy = refresh_compose(State(state), Path("app".into())).await;
+        assert!(matches!(busy, Err(AppError::Busy)));
+        drop(permit);
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|args| args.iter().any(|arg| arg == "config"))
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|args| !args.iter().any(|arg| arg == "up" || arg == "pull"))
+        );
     }
 }

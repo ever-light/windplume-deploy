@@ -40,6 +40,11 @@ projects:
 构建服务会被忽略。默认列出 Registry 返回的全部非空 tag；符合 `x.y.z` 的 tag
 按 SemVer 排序并可使用“部署最新版本”，其他 tag 仍可手动选择。
 
+修改已配置的 Compose 文件后，可在对应项目标题旁点击“刷新 Compose”。
+刷新会重新识别服务、镜像和 Registry 来源，但不会执行 `pull` 或 `up`，
+也不会立即将挂载、环境变量等变更应用到运行中的容器。修改 Compose
+项目名时仍需重启服务。
+
 `storage.data_dir` 默认是 `/var/lib/windplume-deploy`。监听地址、缓存和存储限制
 仅在需要覆盖时配置：
 

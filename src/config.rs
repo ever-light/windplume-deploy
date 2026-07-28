@@ -198,17 +198,6 @@ impl Config {
         }
         Ok(())
     }
-
-    pub fn project(&self, id: &str) -> Option<&ProjectConfig> {
-        self.projects.iter().find(|project| project.id == id)
-    }
-
-    pub fn service(&self, project_id: &str, service_id: &str) -> Option<&ServiceConfig> {
-        self.project(project_id)?
-            .services
-            .iter()
-            .find(|service| service.id == service_id)
-    }
 }
 
 impl ProjectConfig {

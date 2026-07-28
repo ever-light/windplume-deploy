@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::{
@@ -109,9 +110,9 @@ pub async fn write_override(
 
 #[derive(Clone)]
 pub struct Compose {
-    cfg: ProjectConfig,
+    cfg: Arc<RwLock<ProjectConfig>>,
     override_file: PathBuf,
-    runner: std::sync::Arc<dyn CommandRunner>,
+    runner: Arc<dyn CommandRunner>,
 }
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RuntimeState {
@@ -146,54 +147,63 @@ struct InspectHealth {
 }
 
 impl Compose {
-    pub fn new(
-        cfg: ProjectConfig,
-        override_file: PathBuf,
-        runner: std::sync::Arc<dyn CommandRunner>,
-    ) -> Self {
+    pub fn new(cfg: ProjectConfig, override_file: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
         Self {
-            cfg,
+            cfg: Arc::new(RwLock::new(cfg)),
             override_file,
             runner,
         }
     }
-    fn cwd(&self) -> &Path {
-        self.cfg.project_dir()
+    pub fn project(&self) -> ProjectConfig {
+        self.cfg
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
-    fn base_args(&self) -> Vec<String> {
+    pub fn replace_project(&self, project: ProjectConfig) {
+        *self.cfg.write().unwrap_or_else(|error| error.into_inner()) = project;
+    }
+    pub async fn resolve_candidate(&self) -> anyhow::Result<ProjectConfig> {
+        let mut candidate = self.project();
+        resolve_project(&mut candidate, self.runner.clone()).await?;
+        Ok(candidate)
+    }
+    fn base_args(&self) -> (Vec<String>, PathBuf) {
+        let cfg = self.project();
+        let cwd = cfg.project_dir().to_path_buf();
         let mut args = vec![
             "compose".into(),
             "--project-name".into(),
-            self.cfg.id.clone(),
+            cfg.id.clone(),
             "--project-directory".into(),
-            self.cfg.project_dir().display().to_string(),
+            cwd.display().to_string(),
         ];
-        for file in &self.cfg.compose_files {
+        for file in &cfg.compose_files {
             args.extend(["-f".into(), file.display().to_string()]);
         }
         args.extend(["-f".into(), self.override_file.display().to_string()]);
-        args
+        (args, cwd)
     }
     pub async fn pull(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
-        let mut args = self.base_args();
+        let (mut args, cwd) = self.base_args();
         args.extend(["pull".into(), service.into()]);
-        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker compose pull 执行失败\n{}", out.log);
         }
         Ok(out.log)
     }
     pub async fn up(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
-        let mut args = self.base_args();
+        let (mut args, cwd) = self.base_args();
         args.extend(["up".into(), "-d".into(), service.into()]);
-        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker compose up 执行失败\n{}", out.log);
         }
         Ok(out.log)
     }
     pub async fn logs(&self, service: &str, tail: u32, limit: Duration) -> anyhow::Result<String> {
-        let mut args = self.base_args();
+        let (mut args, cwd) = self.base_args();
         args.extend([
             "logs".into(),
             "--no-color".into(),
@@ -201,16 +211,16 @@ impl Compose {
             tail.to_string(),
             service.into(),
         ]);
-        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker compose logs 执行失败\n{}", out.log);
         }
         Ok(out.log)
     }
     async fn ids(&self, service: &str, limit: Duration) -> anyhow::Result<(Vec<String>, String)> {
-        let mut args = self.base_args();
+        let (mut args, cwd) = self.base_args();
         args.extend(["ps".into(), "-q".into(), service.into()]);
-        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker compose ps 执行失败\n{}", out.log);
         }
@@ -234,7 +244,8 @@ impl Compose {
         }
         let mut args = vec!["inspect".into()];
         args.extend_from_slice(ids);
-        let out = self.runner.run("docker", &args, self.cwd(), limit).await?;
+        let cwd = self.project().project_dir().to_path_buf();
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker inspect 执行失败\n{}", out.log);
         }

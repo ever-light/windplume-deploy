@@ -117,6 +117,14 @@ impl RegistryClient {
         Ok(result)
     }
 
+    pub async fn invalidate_project(&self, project_id: &str) {
+        let prefix = format!("{project_id}/");
+        self.cache
+            .write()
+            .await
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     async fn oci_versions(
         &self,
         registry: &str,
@@ -392,5 +400,34 @@ mod tests {
         assert_eq!(credentials.username, "octocat");
         assert_eq!(credentials.password, "github_pat_secret");
         assert!(same_registry("https://ghcr.io", "ghcr.io"));
+    }
+
+    #[tokio::test]
+    async fn invalidates_only_selected_project_cache() {
+        let client = RegistryClient::new(Duration::from_secs(60)).unwrap();
+        let cached = PackageVersion {
+            version: "1.0.0".into(),
+            source_id: "1.0.0".into(),
+            digest: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let now = Instant::now();
+        client
+            .cache
+            .write()
+            .await
+            .insert("app/api".into(), (now, vec![cached.clone()]));
+        client
+            .cache
+            .write()
+            .await
+            .insert("other/api".into(), (now, vec![cached]));
+
+        client.invalidate_project("app").await;
+
+        let cache = client.cache.read().await;
+        assert!(!cache.contains_key("app/api"));
+        assert!(cache.contains_key("other/api"));
     }
 }

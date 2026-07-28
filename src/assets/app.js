@@ -81,7 +81,7 @@ async function loadProjects() {
           (project) => `<section class="project-block">
             <div class="project-head">
               <div><h3>${esc(project.id)}</h3><p class="muted">${esc(project.compose_files.join(", "))}</p></div>
-              ${project.deployment_in_progress ? badge("部署中") : ""}
+              <div class="actions"><button class="refresh-compose" data-project="${esc(project.id)}" ${project.deployment_in_progress ? "disabled" : ""}>刷新 Compose</button>${project.deployment_in_progress ? badge("部署中") : ""}</div>
             </div>
             <div class="cards">${project.services.map((service) => serviceCard(project, service)).join("")}</div>
           </section>`,
@@ -95,6 +95,9 @@ async function loadProjects() {
         event.stopPropagation();
         showContainerLogs(button.dataset.project, button.dataset.service);
       };
+    });
+    document.querySelectorAll(".refresh-compose").forEach((button) => {
+      button.onclick = () => refreshCompose(button.dataset.project, button);
     });
   } catch (error) {
     diagnose("项目状态", error.message);
@@ -258,6 +261,27 @@ async function showContainerLogs(projectId, serviceId) {
   } catch (error) {
     diagnose(`${projectId} / ${serviceId} 容器日志`, error.message);
     $("#container-logs-content").textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function refreshCompose(projectId, button) {
+  button.disabled = true;
+  try {
+    const result = await api(
+      `/api/projects/${encodeURIComponent(projectId)}/refresh-compose`,
+      { method: "POST" },
+    );
+    if (selected?.project.id === projectId) {
+      selected = null;
+      latestVersion = null;
+      $("#versions-section").hidden = true;
+    }
+    await loadProjects();
+    toast(`Compose 已刷新，识别到 ${result.service_count} 个服务`);
+  } catch (error) {
+    diagnose(`${projectId} 刷新 Compose`, error.message);
+    toast(error.message);
+    button.disabled = false;
   }
 }
 
