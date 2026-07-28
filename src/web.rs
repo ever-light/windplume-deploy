@@ -470,6 +470,23 @@ mod tests {
             js.headers()[header::CONTENT_TYPE],
             "text/javascript; charset=utf-8"
         );
+        let js = String::from_utf8(to_bytes(js.into_body(), usize::MAX).await.unwrap().to_vec())
+            .unwrap();
+        assert!(js.contains("selectService(selected.project.id, selected.service.id, true)"));
+
+        let index = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let index = String::from_utf8(
+            to_bytes(index.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(index.contains(">刷新版本</button>"));
 
         let css = app
             .clone()

@@ -13,7 +13,7 @@ fn default_listen() -> SocketAddr {
     "127.0.0.1:8180".parse().unwrap()
 }
 fn default_cache() -> u64 {
-    60
+    7 * 24 * 60 * 60
 }
 fn default_data_dir() -> PathBuf {
     "/var/lib/windplume-deploy".into()
@@ -307,6 +307,7 @@ mod tests {
 
         let cfg = Config::load(&config).unwrap();
         assert_eq!(cfg.server.listen, default_listen());
+        assert_eq!(cfg.registries.cache_seconds, 604_800);
         assert_eq!(cfg.storage.history_limit, 500);
         assert_eq!(cfg.projects[0].health_timeout_seconds, 120);
 
@@ -341,6 +342,12 @@ mod tests {
             }],
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn registry_cache_duration_can_be_overridden() {
+        let config: RegistryConfig = serde_yaml::from_str("cache_seconds: 3600\n").unwrap();
+        assert_eq!(config.cache_seconds, 3600);
     }
 
     #[test]

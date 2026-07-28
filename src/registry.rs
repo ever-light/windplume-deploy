@@ -89,11 +89,8 @@ impl RegistryClient {
         pattern: &str,
         refresh: bool,
     ) -> Result<Vec<PackageVersion>, AppError> {
-        if !refresh
-            && let Some((at, result)) = self.cache.read().await.get(cache_key)
-            && at.elapsed() < self.ttl
-        {
-            return Ok(result.clone());
+        if let Some(result) = self.cached_versions(cache_key, refresh).await {
+            return Ok(result);
         }
 
         let raw = match source {
@@ -110,11 +107,27 @@ impl RegistryClient {
             } => self.oci_versions(registry, repository).await?,
         };
         let result = normalize(raw, pattern)?;
+        self.store_versions(cache_key, result.clone()).await;
+        Ok(result)
+    }
+
+    async fn cached_versions(&self, cache_key: &str, refresh: bool) -> Option<Vec<PackageVersion>> {
+        if refresh {
+            return None;
+        }
+        self.cache
+            .read()
+            .await
+            .get(cache_key)
+            .filter(|(at, _)| at.elapsed() < self.ttl)
+            .map(|(_, result)| result.clone())
+    }
+
+    async fn store_versions(&self, cache_key: &str, result: Vec<PackageVersion>) {
         self.cache
             .write()
             .await
-            .insert(cache_key.into(), (Instant::now(), result.clone()));
-        Ok(result)
+            .insert(cache_key.into(), (Instant::now(), result));
     }
 
     pub async fn invalidate_project(&self, project_id: &str) {
@@ -429,5 +442,36 @@ mod tests {
         let cache = client.cache.read().await;
         assert!(!cache.contains_key("app/api"));
         assert!(cache.contains_key("other/api"));
+    }
+
+    #[tokio::test]
+    async fn cache_can_be_bypassed_and_failed_refresh_preserves_previous_versions() {
+        let client = RegistryClient::new(Duration::from_secs(604_800)).unwrap();
+        let old = PackageVersion {
+            version: "1.0.0".into(),
+            source_id: "1.0.0".into(),
+            digest: None,
+            created_at: None,
+            updated_at: None,
+        };
+        client.store_versions("app/api", vec![old]).await;
+
+        let cached = client.cached_versions("app/api", false).await.unwrap();
+        assert_eq!(cached[0].version, "1.0.0");
+        assert!(client.cached_versions("app/api", true).await.is_none());
+
+        let refreshed = PackageVersion {
+            version: "2.0.0".into(),
+            source_id: "2.0.0".into(),
+            digest: None,
+            created_at: None,
+            updated_at: None,
+        };
+        client.store_versions("app/api", vec![refreshed]).await;
+
+        // A failed forced refresh never calls store_versions, so the last good result remains.
+        assert!(client.cached_versions("app/api", true).await.is_none());
+        let preserved = client.cached_versions("app/api", false).await.unwrap();
+        assert_eq!(preserved[0].version, "2.0.0");
     }
 }

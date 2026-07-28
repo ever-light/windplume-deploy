@@ -45,15 +45,16 @@ projects:
 也不会立即将挂载、环境变量等变更应用到运行中的容器。修改 Compose
 项目名时仍需重启服务。
 
-`storage.data_dir` 默认是 `/var/lib/windplume-deploy`。监听地址、缓存和存储限制
-仅在需要覆盖时配置：
+`storage.data_dir` 默认是 `/var/lib/windplume-deploy`。镜像版本列表默认在内存中缓存
+7 天，程序重启后重新查询 Registry；页面的“刷新版本”可随时强制更新。
+监听地址、缓存和存储限制仅在需要覆盖时配置：
 
 ```yaml
 server:
   listen: 127.0.0.1:8180
 
 registries:
-  cache_seconds: 60
+  cache_seconds: 604800
 
 storage:
   data_dir: /var/lib/windplume-deploy
