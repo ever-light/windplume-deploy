@@ -5,6 +5,7 @@ mod error;
 mod registry;
 mod state;
 mod storage;
+mod update;
 mod web;
 use clap::Parser;
 use compose::ProcessRunner;
@@ -15,6 +16,7 @@ use tokio::sync::Semaphore;
 use tower_http::{sensitive_headers::SetSensitiveRequestHeadersLayer, trace::TraceLayer};
 
 #[derive(Parser)]
+#[command(version = update::BUILD_VERSION)]
 struct Args {
     #[arg(long, default_value = "/etc/windplume-deploy/config.yaml")]
     config: PathBuf,
@@ -43,6 +45,8 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let registry =
         registry::RegistryClient::new(Duration::from_secs(cfg.registries.cache_seconds))?;
+    let updates =
+        update::UpdateManager::new(update::UpdateManager::runtime_root(&cfg.storage.data_dir))?;
     let projects = cfg
         .projects
         .iter()
@@ -71,15 +75,17 @@ async fn main() -> anyhow::Result<()> {
         config: cfg.clone(),
         storage,
         registry,
+        updates,
         projects: Arc::new(projects),
     };
     deployment::rebuild_override(&state).await?;
+    let listener = tokio::net::TcpListener::bind(cfg.server.listen).await?;
+    state.updates.write_readiness().await?;
     let app = web::router(state)
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
             axum::http::header::AUTHORIZATION,
         )))
         .layer(TraceLayer::new_for_http());
-    let listener = tokio::net::TcpListener::bind(cfg.server.listen).await?;
     tracing::info!(listen=%cfg.server.listen,"windplume-deploy started");
     axum::serve(listener, app).await?;
     Ok(())

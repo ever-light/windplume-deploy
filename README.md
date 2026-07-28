@@ -96,6 +96,19 @@ services:
 
 程序不会改写原始 Compose、`.env`、`env_file` 或业务目录。
 
+每个服务还提供以下生命周期操作：
+
+- “重建当前版本”执行 `docker compose up -d --force-recreate --no-deps
+  <service>`，重新读取 Compose、`.env` 和 `env_file`，但不切换版本或主动
+  拉取镜像。
+- “停止”保留容器；后续行为仍受服务的 Docker restart policy 影响。
+- “下线”停止并删除目标服务容器，不删除镜像、命名卷、绑定目录或
+  项目共享网络。可通过“重建当前版本”再次上线。
+
+部署、重建、停止和下线都记录在“操作历史”中。同一 Compose 项目的
+操作互斥执行。重建后若新配置不健康，程序会记录失败，但无法自动
+恢复被用户原地修改的旧 Compose 配置。
+
 每个服务卡片提供“查看日志”按钮，按需执行
 `docker compose logs --no-color --tail 200 <service>` 并显示最近 200 行。
 该功能不会持续跟踪或存储容器日志。
@@ -117,9 +130,26 @@ sudo systemctl start windplume-deploy
 ```
 
 安装脚本创建 `windplume-deploy` 系统用户，将其加入 `docker` 组，安装文件并启用
-systemd 服务，但不会在配置完成前启动服务。脚本会将 `/opt/windplume` 目录树的组
+systemd 服务，但不会在配置完成前启动服务。安装脚本还会启用独立的 systemd
+更新助手。脚本会将 `/opt/windplume` 目录树的组
 设为 `windplume-deploy`，授予组读取和目录进入权限，并对目录设置 setgid，使以后
 创建的项目继续继承该组。Compose 文件、`.env` 和 `env_file` 因此可由服务读取。
+
+## 程序自更新
+
+页面从固定的公开 GitHub 仓库检查最新稳定 Release，仅在用户确认后更新。
+更新前会校验 asset 名称、SemVer、SHA-256 和候选二进制报告的版本。
+SHA-256 只是完整性校验，不是独立的代码签名。
+
+替换 `/usr/local/bin/windplume-deploy` 和重启由 root 运行的独立 systemd unit
+完成。新版本未能就绪时，助手会恢复旧二进制并重启。Deploy 页面会短暂
+中断，但更新过程不执行任何业务 Compose 命令，不会停止业务容器。
+已安装环境的更新控制文件固定位于 `/var/lib/windplume-deploy/update`，
+不受业务状态的 `storage.data_dir` 自定义值影响。
+
+首次启用自更新必须人工执行一次包含更新助手的新版 `install.sh`。
+后续常规版本可从页面更新。自更新只替换主二进制；若 Release 说明要求更新
+systemd 或 helper 协议，需再次人工执行安装脚本。
 
 公开 Docker Hub 和公开 GHCR 的 tag 查询及镜像拉取通常不需要 Token。如果
 Registry 需要认证，请使用服务用户登录；服务会从该用户的 Docker 配置中读取

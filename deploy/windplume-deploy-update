@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+service_name="windplume-deploy"
+data_dir="/var/lib/windplume-deploy"
+update_dir="${data_dir}/update"
+request_file="${update_dir}/request"
+candidate_file="${update_dir}/candidate"
+checksum_file="${update_dir}/candidate.sha256"
+status_file="${update_dir}/status.json"
+ready_file="${update_dir}/ready.json"
+binary_file="/usr/local/bin/${service_name}"
+backup_file="/usr/local/libexec/${service_name}.previous"
+version="unknown"
+installed=false
+
+write_status() {
+  local state="$1"
+  local version="$2"
+  local message="$3"
+  local temporary="${update_dir}/.status.$$.tmp"
+  local now
+  now="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"state":"%s","target_version":"%s","message":"%s","updated_at":"%s"}\n' \
+    "${state}" "${version}" "${message}" "${now}" > "${temporary}"
+  chmod 0644 "${temporary}"
+  mv -f "${temporary}" "${status_file}"
+}
+
+unexpected_failure() {
+  local exit_code="$?"
+  trap - ERR
+  if [[ "${installed}" == true && -f "${backup_file}" ]]; then
+    install -o root -g root -m 0755 "${backup_file}" "${binary_file}.new" || true
+    mv -f "${binary_file}.new" "${binary_file}" || true
+    rm -f "${ready_file}"
+    systemctl restart "${service_name}.service" || true
+    write_status "rolled_back" "${version}" "更新助手异常，已恢复旧版本" || true
+  else
+    write_status "failed" "${version}" "更新助手执行失败" || true
+  fi
+  rm -f "${request_file}"
+  exit "${exit_code}"
+}
+
+trap unexpected_failure ERR
+
+fail_staged_update() {
+  local version="$1"
+  local message="$2"
+  write_status "failed" "${version}" "${message}"
+  rm -f "${request_file}"
+  trap - ERR
+  exit 1
+}
+
+if [[ ! -f "${request_file}" ]]; then
+  exit 0
+fi
+
+version="$(tr -d '[:space:]' < "${request_file}")"
+if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+  fail_staged_update "unknown" "更新请求版本无效"
+fi
+if [[ ! -f "${candidate_file}" || ! -f "${checksum_file}" ]]; then
+  fail_staged_update "${version}" "更新暂存文件不完整"
+fi
+
+checksum="$(tr -d '[:space:]' < "${checksum_file}")"
+if [[ ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
+  fail_staged_update "${version}" "候选二进制校验值无效"
+fi
+if ! printf '%s  %s\n' "${checksum}" "${candidate_file}" | sha256sum --check --status; then
+  fail_staged_update "${version}" "候选二进制 SHA-256 校验失败"
+fi
+if ! candidate_version="$("${candidate_file}" --version 2>/dev/null)" || \
+   [[ "${candidate_version}" != *"${version}"* ]]; then
+  fail_staged_update "${version}" "候选二进制版本不匹配"
+fi
+
+write_status "installing" "${version}" "正在安装并重启管理服务"
+sleep 2
+install -o root -g root -m 0755 "${binary_file}" "${backup_file}"
+install -o root -g root -m 0755 "${candidate_file}" "${binary_file}.new"
+mv -f "${binary_file}.new" "${binary_file}"
+installed=true
+rm -f "${ready_file}"
+
+if systemctl restart "${service_name}.service"; then
+  for _attempt in $(seq 1 30); do
+    if systemctl is-active --quiet "${service_name}.service" && \
+       [[ -f "${ready_file}" ]] && \
+       grep -Fq "\"version\":\"${version}\"" "${ready_file}"; then
+      sleep 5
+      if systemctl is-active --quiet "${service_name}.service" && \
+         grep -Fq "\"version\":\"${version}\"" "${ready_file}"; then
+        write_status "succeeded" "${version}" "更新成功"
+        rm -f "${request_file}" "${candidate_file}" "${checksum_file}"
+        exit 0
+      fi
+    fi
+    sleep 1
+  done
+fi
+
+write_status "rolling_back" "${version}" "新版本启动失败，正在恢复旧版本"
+install -o root -g root -m 0755 "${backup_file}" "${binary_file}.new"
+mv -f "${binary_file}.new" "${binary_file}"
+rm -f "${ready_file}"
+systemctl restart "${service_name}.service" || true
+write_status "rolled_back" "${version}" "新版本启动失败，已恢复旧版本"
+rm -f "${request_file}" "${candidate_file}" "${checksum_file}"
+trap - ERR
+exit 1

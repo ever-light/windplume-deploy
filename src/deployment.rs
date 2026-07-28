@@ -10,12 +10,33 @@ use std::collections::{BTreeMap, HashSet};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAction {
+    Recreate,
+    Stop,
+    Down,
+}
+
+impl LifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recreate => "recreate",
+            Self::Stop => "stop",
+            Self::Down => "down",
+        }
+    }
+}
+
 pub async fn enqueue(
     state: AppState,
     project_id: &str,
     service_id: &str,
     version: &str,
 ) -> Result<Deployment, AppError> {
+    if state.updates.is_active() {
+        return Err(AppError::Updating);
+    }
     let runtime = state
         .project_runtime(project_id)
         .cloned()
@@ -58,6 +79,7 @@ pub async fn enqueue(
         id: Uuid::new_v4().to_string(),
         project_id: project_id.into(),
         service_id: service_id.into(),
+        operation: "deploy".into(),
         previous_version: old.map(|state| state.desired_version),
         target_version: version.into(),
         status: "queued".into(),
@@ -73,6 +95,141 @@ pub async fn enqueue(
         run(state, project, service, task_item, permit).await;
     });
     Ok(item)
+}
+
+pub async fn enqueue_lifecycle(
+    state: AppState,
+    project_id: &str,
+    service_id: &str,
+    action: LifecycleAction,
+) -> Result<Deployment, AppError> {
+    if state.updates.is_active() {
+        return Err(AppError::Updating);
+    }
+    let runtime = state
+        .project_runtime(project_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let permit = runtime
+        .deploy_lock
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
+    let project = runtime.compose.project();
+    let service = project
+        .services
+        .iter()
+        .find(|service| service.id == service_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let version = state
+        .storage
+        .state(project_id, service_id)
+        .await?
+        .map(|item| item.desired_version);
+    let item = Deployment {
+        id: Uuid::new_v4().to_string(),
+        project_id: project_id.into(),
+        service_id: service_id.into(),
+        operation: action.as_str().into(),
+        previous_version: version.clone(),
+        target_version: version.unwrap_or_default(),
+        status: "queued".into(),
+        started_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+        command_log: String::new(),
+        error_message: None,
+        rollback_status: None,
+    };
+    state.storage.create_deployment(&item).await?;
+    let task_item = item.clone();
+    tokio::spawn(async move {
+        run_lifecycle(state, project, service, action, task_item, permit).await;
+    });
+    Ok(item)
+}
+
+async fn run_lifecycle(
+    state: AppState,
+    project: ProjectConfig,
+    service: ServiceConfig,
+    action: LifecycleAction,
+    item: Deployment,
+    _permit: OwnedSemaphorePermit,
+) {
+    if let Err(error) = state.storage.mark_running(&item.id).await {
+        tracing::error!(operation_id=%item.id,error=%error,"cannot mark lifecycle operation running");
+        return;
+    }
+    let mut log = String::new();
+    let result = execute_lifecycle(&state, &project, &service, action, &mut log).await;
+    match result {
+        Ok(()) => {
+            if let Err(error) = state.storage.finish_operation_success(&item.id, &log).await {
+                tracing::error!(operation_id=%item.id,error=%error,"cannot persist lifecycle success");
+            }
+        }
+        Err(error) => {
+            log.push_str(&format!("\n操作失败: {error}\n"));
+            if let Err(storage_error) = state
+                .storage
+                .finish_failure(&item.id, &error.to_string(), "unavailable", &log)
+                .await
+            {
+                tracing::error!(operation_id=%item.id,error=%storage_error,"cannot persist lifecycle failure");
+            }
+        }
+    }
+}
+
+async fn execute_lifecycle(
+    state: &AppState,
+    project: &ProjectConfig,
+    service: &ServiceConfig,
+    action: LifecycleAction,
+    log: &mut String,
+) -> anyhow::Result<()> {
+    let runtime = state
+        .project_runtime(&project.id)
+        .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
+    match action {
+        LifecycleAction::Recreate => {
+            rebuild_project_override(state, project).await?;
+            log.push_str(
+                &runtime
+                    .compose
+                    .recreate(&service.id, project.command_timeout())
+                    .await?,
+            );
+            log.push_str(
+                &runtime
+                    .compose
+                    .wait_healthy(
+                        &service.id,
+                        project.health_timeout(),
+                        project.command_timeout(),
+                    )
+                    .await?,
+            );
+        }
+        LifecycleAction::Stop => {
+            log.push_str(
+                &runtime
+                    .compose
+                    .stop(&service.id, project.command_timeout())
+                    .await?,
+            );
+        }
+        LifecycleAction::Down => {
+            log.push_str(
+                &runtime
+                    .compose
+                    .remove(&service.id, project.command_timeout())
+                    .await?,
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn versions_from_db(
@@ -252,6 +409,7 @@ mod tests {
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
+        update::UpdateManager,
     };
     use std::{
         collections::HashMap,
@@ -328,6 +486,7 @@ mod tests {
                 config,
                 storage,
                 registry,
+                updates: UpdateManager::new(dir.path().into()).unwrap(),
                 projects: Arc::new(HashMap::from([("app".into(), runtime)])),
             },
             project,
@@ -347,6 +506,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             project_id: "app".into(),
             service_id: "identity".into(),
+            operation: "deploy".into(),
             previous_version: None,
             target_version: "1.2.3".into(),
             status: "queued".into(),
@@ -434,6 +594,95 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_preserve_version_and_write_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = r#"[{"Config":{"Image":"ghcr.io/owner/identity:1.2.3","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
+        let (state, project, service) = state(
+            &dir,
+            vec![
+                output(true, "recreate"),
+                output(true, "container\n"),
+                output(true, inspect),
+                output(true, "stop"),
+                output(true, "remove"),
+            ],
+        )
+        .await;
+        state
+            .storage
+            .finish_success(
+                "baseline",
+                "app",
+                "identity",
+                "1.2.3",
+                "ghcr.io/owner/identity:1.2.3",
+                "",
+            )
+            .await
+            .unwrap();
+
+        for action in [
+            LifecycleAction::Recreate,
+            LifecycleAction::Stop,
+            LifecycleAction::Down,
+        ] {
+            let mut item = queued();
+            item.operation = action.as_str().into();
+            item.previous_version = Some("1.2.3".into());
+            item.target_version = "1.2.3".into();
+            state.storage.create_deployment(&item).await.unwrap();
+            let permit = state
+                .project_runtime("app")
+                .unwrap()
+                .deploy_lock
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
+            run_lifecycle(
+                state.clone(),
+                project.clone(),
+                service.clone(),
+                action,
+                item.clone(),
+                permit,
+            )
+            .await;
+            let stored = state.storage.deployment(&item.id).await.unwrap().unwrap();
+            assert_eq!(stored.status, "succeeded");
+            assert_eq!(stored.operation, action.as_str());
+            assert_eq!(stored.rollback_status.as_deref(), Some("not_needed"));
+        }
+
+        assert_eq!(
+            state
+                .storage
+                .state("app", "identity")
+                .await
+                .unwrap()
+                .unwrap()
+                .desired_version,
+            "1.2.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_update_blocks_new_service_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, _) = state(&dir, Vec::new()).await;
+        assert!(state.updates.begin());
+        assert!(matches!(
+            enqueue_lifecycle(state.clone(), "app", "identity", LifecycleAction::Stop).await,
+            Err(AppError::Updating)
+        ));
+        assert!(matches!(
+            enqueue(state.clone(), "app", "identity", "1.2.3").await,
+            Err(AppError::Updating)
+        ));
+        state.updates.cancel();
     }
 
     #[tokio::test]

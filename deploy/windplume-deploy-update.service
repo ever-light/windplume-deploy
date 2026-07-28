@@ -1,0 +1,8 @@
+[Unit]
+Description=Install a staged Windplume Deploy update
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/windplume-deploy-update
+TimeoutStartSec=120

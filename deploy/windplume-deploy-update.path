@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a staged Windplume Deploy update
+
+[Path]
+PathExists=/var/lib/windplume-deploy/update/request
+Unit=windplume-deploy-update.service
+
+[Install]
+WantedBy=multi-user.target

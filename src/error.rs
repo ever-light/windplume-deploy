@@ -9,12 +9,16 @@ pub enum AppError {
     Invalid(String),
     #[error("版本不存在: {0}")]
     VersionNotFound(String),
-    #[error("已有部署任务正在运行")]
+    #[error("项目已有操作正在运行")]
     Busy,
+    #[error("系统更新期间暂停新操作")]
+    Updating,
     #[error("无法读取镜像版本: {0}")]
     Package(String),
     #[error("内部错误: {0}")]
     Internal(String),
+    #[error("无法更新程序: {0}")]
+    Update(String),
 }
 
 #[derive(Serialize)]
@@ -38,6 +42,11 @@ impl IntoResponse for AppError {
                 "deployment_in_progress",
                 self.to_string(),
             ),
+            Self::Updating => (
+                StatusCode::CONFLICT,
+                "system_update_in_progress",
+                self.to_string(),
+            ),
             Self::Package(_) => (
                 StatusCode::BAD_GATEWAY,
                 "package_query_failed",
@@ -48,6 +57,11 @@ impl IntoResponse for AppError {
                 "internal_error",
                 "内部服务错误".into(),
             ),
+            Self::Update(_) => (
+                StatusCode::BAD_GATEWAY,
+                "system_update_failed",
+                self.to_string(),
+            ),
         };
         (status, Json(ErrorBody { code, message })).into_response()
     }
@@ -55,6 +69,12 @@ impl IntoResponse for AppError {
 
 impl From<sqlx::Error> for AppError {
     fn from(value: sqlx::Error) -> Self {
+        Self::Internal(value.to_string())
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(value: std::io::Error) -> Self {
         Self::Internal(value.to_string())
     }
 }

@@ -28,6 +28,7 @@ pub struct Deployment {
     pub id: String,
     pub project_id: String,
     pub service_id: String,
+    pub operation: String,
     pub previous_version: Option<String>,
     pub target_version: String,
     pub status: String,
@@ -95,8 +96,8 @@ impl Storage {
             .await
     }
     pub async fn create_deployment(&self, d: &Deployment) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO deployments(id,project_id,service_id,previous_version,target_version,status,started_at,command_log) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(&d.id).bind(&d.project_id).bind(&d.service_id).bind(&d.previous_version).bind(&d.target_version)
+        sqlx::query("INSERT INTO deployments(id,project_id,service_id,operation,previous_version,target_version,status,started_at,command_log) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(&d.id).bind(&d.project_id).bind(&d.service_id).bind(&d.operation).bind(&d.previous_version).bind(&d.target_version)
             .bind(&d.status).bind(&d.started_at).bind(&d.command_log).execute(&self.pool).await?;
         self.prune().await
     }
@@ -134,6 +135,11 @@ impl Storage {
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE deployments SET status='failed',finished_at=?,command_log=?,error_message=?,rollback_status=? WHERE id=?")
             .bind(Utc::now().to_rfc3339()).bind(truncate_utf8(log, self.max_log_bytes)).bind(error).bind(rollback).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn finish_operation_success(&self, id: &str, log: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE deployments SET status='succeeded',finished_at=?,command_log=?,rollback_status='not_needed' WHERE id=?")
+            .bind(Utc::now().to_rfc3339()).bind(truncate_utf8(log, self.max_log_bytes)).bind(id).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn deployments(&self, limit: u32) -> Result<Vec<Deployment>, sqlx::Error> {
@@ -186,6 +192,7 @@ mod tests {
                 id: number.to_string(),
                 project_id: "app".into(),
                 service_id: "svc".into(),
+                operation: "deploy".into(),
                 previous_version: None,
                 target_version: format!("1.0.{number}"),
                 status: "queued".into(),
@@ -209,6 +216,14 @@ mod tests {
                 .all(|item| item.status == "interrupted")
         );
         reopened.health().await.unwrap();
+        assert!(
+            reopened
+                .deployments(10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|item| item.operation == "deploy")
+        );
     }
 
     #[tokio::test]
@@ -240,6 +255,25 @@ mod tests {
                 .unwrap()
                 .desired_version,
             "2.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_history_rows_default_to_deploy_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        sqlx::query("INSERT INTO deployments(id,project_id,service_id,previous_version,target_version,status,started_at,command_log) VALUES('legacy','app','api',NULL,'1.0.0','succeeded','2026-01-01T00:00:00Z','ok')")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .deployment("legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .operation,
+            "deploy"
         );
     }
 }

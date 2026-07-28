@@ -1,4 +1,7 @@
-use crate::{compose::Compose, config::Config, registry::RegistryClient, storage::Storage};
+use crate::{
+    compose::Compose, config::Config, registry::RegistryClient, storage::Storage,
+    update::UpdateManager,
+};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -14,6 +17,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub storage: Storage,
     pub registry: RegistryClient,
+    pub updates: UpdateManager,
     pub projects: Arc<HashMap<String, ProjectRuntime>>,
 }
 

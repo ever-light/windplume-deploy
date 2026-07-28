@@ -20,15 +20,29 @@ unit_source="${script_dir}/windplume-deploy.service"
 if [[ ! -f "${unit_source}" ]]; then
   unit_source="${script_dir}/deploy/windplume-deploy.service"
 fi
+update_path_source="${script_dir}/windplume-deploy-update.path"
+update_unit_source="${script_dir}/windplume-deploy-update.service"
+update_helper_source="${script_dir}/windplume-deploy-update"
+if [[ ! -f "${update_path_source}" ]]; then
+  update_path_source="${script_dir}/deploy/windplume-deploy-update.path"
+  update_unit_source="${script_dir}/deploy/windplume-deploy-update.service"
+  update_helper_source="${script_dir}/deploy/windplume-deploy-update"
+fi
 
-for source_file in "${binary_source}" "${config_source}" "${unit_source}"; do
+for source_file in \
+  "${binary_source}" \
+  "${config_source}" \
+  "${unit_source}" \
+  "${update_path_source}" \
+  "${update_unit_source}" \
+  "${update_helper_source}"; do
   if [[ ! -f "${source_file}" ]]; then
     echo "安装包不完整，缺少文件：${source_file}" >&2
     exit 1
   fi
 done
 
-for command_name in chgrp chmod docker find getent groupadd id install systemctl useradd usermod; do
+for command_name in chgrp chmod docker find getent groupadd id install sha256sum systemctl useradd usermod; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "缺少必要命令：${command_name}" >&2
     exit 1
@@ -62,6 +76,7 @@ usermod --append --groups docker "${service_user}"
 
 install -d -o root -g "${service_group}" -m 0750 "${config_dir}"
 install -d -o "${service_user}" -g "${service_group}" -m 0750 "${data_dir}"
+install -d -o root -g root -m 0755 /usr/local/libexec
 
 # Compose 项目默认部署在这里。服务需要遍历目录并读取 Compose、.env 和
 # env_file；目录上的 setgid 可让之后创建的内容继续继承服务组。
@@ -75,6 +90,12 @@ fi
 
 install -o root -g root -m 0755 "${binary_source}" "/usr/local/bin/${service_name}"
 install -o root -g root -m 0644 "${unit_source}" "/etc/systemd/system/${service_name}.service"
+install -o root -g root -m 0644 \
+  "${update_path_source}" "/etc/systemd/system/${service_name}-update.path"
+install -o root -g root -m 0644 \
+  "${update_unit_source}" "/etc/systemd/system/${service_name}-update.service"
+install -o root -g root -m 0755 \
+  "${update_helper_source}" "/usr/local/libexec/${service_name}-update"
 
 if [[ ! -e "${config_dir}/config.yaml" ]]; then
   install -o root -g "${service_group}" -m 0640 \
@@ -86,6 +107,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable "${service_name}.service"
+systemctl enable --now "${service_name}-update.path"
 
 echo
 echo "安装文件已就绪，服务尚未启动。"
@@ -98,3 +120,4 @@ echo "2. ${project_root} 已配置为可由 ${service_user} 用户读取"
 echo "3. 公开 Docker Hub/GHCR 无需登录；需要认证时使用：sudo -H -u ${service_user} docker login ghcr.io"
 echo "4. 启动服务：sudo systemctl start ${service_name}"
 echo "5. 查看状态：systemctl status ${service_name}"
+echo "6. 已启用 GitHub Release 手动自更新助手"

@@ -58,6 +58,8 @@ jobs:
           key: linux-musl-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build release binary
+        env:
+          WINDPLUME_BUILD_VERSION: ${{ steps.package.outputs.version }}
         run: cargo +1.96 build --locked --release --target "${TARGET}"
 
       - name: Package binary
@@ -72,7 +74,10 @@ jobs:
           install -m 0755 "target/${TARGET}/release/windplume-deploy" \
             "${package_dir}/windplume-deploy"
           install -m 0644 README.md config.example.yaml \
-            deploy/windplume-deploy.service "${package_dir}/"
+            deploy/windplume-deploy.service \
+            deploy/windplume-deploy-update.path \
+            deploy/windplume-deploy-update.service "${package_dir}/"
+          install -m 0755 deploy/windplume-deploy-update "${package_dir}/"
           install -m 0755 install.sh "${package_dir}/install.sh"
 
           tar -C dist -czf "dist/${ARCHIVE}" \

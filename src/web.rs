@@ -23,6 +23,10 @@ pub fn router(state: AppState) -> Router {
             post(deploy),
         )
         .route(
+            "/api/projects/{project_id}/services/{service_id}/lifecycle",
+            post(lifecycle),
+        )
+        .route(
             "/api/projects/{project_id}/services/{service_id}/logs",
             get(service_logs),
         )
@@ -30,6 +34,8 @@ pub fn router(state: AppState) -> Router {
             "/api/projects/{project_id}/refresh-compose",
             post(refresh_compose),
         )
+        .route("/api/system/update", get(system_update).post(start_update))
+        .route("/api/system/update/status", get(system_update_status))
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
         .route("/", get(index))
@@ -70,7 +76,7 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
             .project_runtime(&configured_project.id)
             .ok_or_else(|| AppError::Internal("Compose 项目运行时不存在".into()))?;
         let project = runtime.compose.project();
-        let busy = runtime.deploy_lock.available_permits() == 0;
+        let busy = state.updates.is_active() || runtime.deploy_lock.available_permits() == 0;
         let mut services = Vec::new();
         for service in &project.services {
             let desired = state.storage.state(&project.id, &service.id).await?;
@@ -181,6 +187,28 @@ async fn deploy(
     ))
 }
 
+#[derive(Deserialize)]
+struct LifecycleRequest {
+    action: deployment::LifecycleAction,
+}
+
+async fn lifecycle(
+    State(state): State<AppState>,
+    Path((project_id, service_id)): Path<(String, String)>,
+    body: Result<Json<LifecycleRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, AppError> {
+    let Json(request) = body.map_err(|error| AppError::Invalid(error.body_text()))?;
+    let operation =
+        deployment::enqueue_lifecycle(state, &project_id, &service_id, request.action).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "operation_id": operation.id,
+            "status": operation.status
+        })),
+    ))
+}
+
 async fn service_logs(
     State(state): State<AppState>,
     Path((project_id, service_id)): Path<(String, String)>,
@@ -225,6 +253,9 @@ async fn refresh_compose(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    if state.updates.is_active() {
+        return Err(AppError::Updating);
+    }
     let runtime = state
         .project_runtime(&project_id)
         .cloned()
@@ -262,6 +293,79 @@ async fn refresh_compose(
         "project_id": project_id,
         "service_count": service_count
     })))
+}
+
+#[derive(Default, Deserialize)]
+struct UpdateQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn system_update(
+    State(state): State<AppState>,
+    Query(query): Query<UpdateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let latest = state.updates.latest(query.refresh).await?;
+    let update_available = match (
+        semver::Version::parse(&latest.version),
+        semver::Version::parse(crate::update::BUILD_VERSION),
+    ) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => false,
+    };
+    Ok(Json(serde_json::json!({
+        "current_version": crate::update::BUILD_VERSION,
+        "latest": latest,
+        "update_available": update_available,
+        "self_update_supported": state.updates.self_update_supported(),
+        "status": state.updates.status().await
+    })))
+}
+
+async fn system_update_status(State(state): State<AppState>) -> Json<crate::update::UpdateStatus> {
+    Json(state.updates.status().await)
+}
+
+async fn start_update(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    if !state.updates.self_update_supported() {
+        return Err(AppError::Update(
+            "当前不支持自更新，请确认为 Linux x86_64 且已安装更新助手".into(),
+        ));
+    }
+    let release = state.updates.latest(true).await?;
+    let current = semver::Version::parse(crate::update::BUILD_VERSION)
+        .map_err(|_| AppError::Update("当前程序版本无效".into()))?;
+    let target = semver::Version::parse(&release.version)
+        .map_err(|_| AppError::Update("Release 版本无效".into()))?;
+    if target <= current {
+        return Err(AppError::Invalid("当前已是最新稳定版".into()));
+    }
+    if !state.updates.begin() {
+        return Err(AppError::Updating);
+    }
+    let mut permits = Vec::new();
+    for runtime in state.projects.values() {
+        match runtime.deploy_lock.clone().try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => {
+                state.updates.cancel();
+                return Err(AppError::Busy);
+            }
+        }
+    }
+    let manager = state.updates.clone();
+    let target_version = release.version.clone();
+    tokio::spawn(async move {
+        let _permits = permits;
+        manager.prepare_and_trigger(release).await;
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "target_version": target_version,
+            "status": "preparing"
+        })),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -320,6 +424,7 @@ mod tests {
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
+        update::UpdateManager,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -389,6 +494,7 @@ mod tests {
             config,
             storage,
             registry,
+            updates: UpdateManager::new(dir.path().into()).unwrap(),
             projects: Arc::new(HashMap::from([("app".into(), runtime)])),
         })
     }
@@ -436,6 +542,7 @@ mod tests {
                 config,
                 storage,
                 registry: RegistryClient::new(Duration::from_secs(60)).unwrap(),
+                updates: UpdateManager::new(dir.path().into()).unwrap(),
                 projects: Arc::new(HashMap::from([("app".into(), runtime)])),
             },
             runner,
@@ -473,6 +580,9 @@ mod tests {
         let js = String::from_utf8(to_bytes(js.into_body(), usize::MAX).await.unwrap().to_vec())
             .unwrap();
         assert!(js.contains("selectService(selected.project.id, selected.service.id, true)"));
+        assert!(js.contains("/lifecycle"));
+        assert!(js.contains("/api/system/update"));
+        assert!(js.contains("重建当前版本"));
 
         let index = app
             .clone()
@@ -487,6 +597,7 @@ mod tests {
         )
         .unwrap();
         assert!(index.contains(">刷新版本</button>"));
+        assert!(index.contains("系统更新"));
 
         let css = app
             .clone()

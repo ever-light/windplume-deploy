@@ -202,6 +202,44 @@ impl Compose {
         }
         Ok(out.log)
     }
+    pub async fn recreate(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
+        let (mut args, cwd) = self.base_args();
+        args.extend([
+            "up".into(),
+            "-d".into(),
+            "--force-recreate".into(),
+            "--no-deps".into(),
+            service.into(),
+        ]);
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose 重建服务失败\n{}", out.log);
+        }
+        Ok(out.log)
+    }
+    pub async fn stop(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
+        let (mut args, cwd) = self.base_args();
+        args.extend(["stop".into(), service.into()]);
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose 停止服务失败\n{}", out.log);
+        }
+        Ok(out.log)
+    }
+    pub async fn remove(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
+        let (mut args, cwd) = self.base_args();
+        args.extend([
+            "rm".into(),
+            "--stop".into(),
+            "--force".into(),
+            service.into(),
+        ]);
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose 下线服务失败\n{}", out.log);
+        }
+        Ok(out.log)
+    }
     pub async fn logs(&self, service: &str, tail: u32, limit: Duration) -> anyhow::Result<String> {
         let (mut args, cwd) = self.base_args();
         args.extend([
@@ -328,6 +366,12 @@ impl Compose {
                 container_status: "unknown".into(),
             };
         };
+        if ids.is_empty() {
+            return RuntimeState {
+                actual_image: None,
+                container_status: "down".into(),
+            };
+        }
         self.inspect(&ids, limit)
             .await
             .map(|x| x.0)
@@ -475,6 +519,7 @@ mod tests {
             output(
                 r#"[{"Config":{"Image":"image:3","Healthcheck":{"Test":["CMD","false"]}},"State":{"Status":"running","Health":{"Status":"unhealthy"}}}]"#,
             ),
+            output(""),
         ])));
         let compose = Compose::new(
             ProjectConfig {
@@ -507,6 +552,13 @@ mod tests {
                 .await
                 .container_status,
             "unhealthy"
+        );
+        assert_eq!(
+            compose
+                .runtime("svc", Duration::from_secs(1))
+                .await
+                .container_status,
+            "down"
         );
     }
 
@@ -558,6 +610,12 @@ mod tests {
             .logs("api", 200, Duration::from_secs(1))
             .await
             .unwrap();
+        compose
+            .recreate("api", Duration::from_secs(1))
+            .await
+            .unwrap();
+        compose.stop("api", Duration::from_secs(1)).await.unwrap();
+        compose.remove("api", Duration::from_secs(1)).await.unwrap();
         let calls = runner.0.lock().unwrap();
         let (args, cwd) = &calls[0];
         assert_eq!(cwd, dir.path());
@@ -582,6 +640,16 @@ mod tests {
         assert_eq!(
             &log_args[log_args.len() - 5..],
             ["logs", "--no-color", "--tail", "200", "api"]
+        );
+        assert_eq!(
+            &calls[2].0[calls[2].0.len() - 5..],
+            ["up", "-d", "--force-recreate", "--no-deps", "api"]
+        );
+        assert!(!calls[2].0.iter().any(|arg| arg == "pull"));
+        assert_eq!(&calls[3].0[calls[3].0.len() - 2..], ["stop", "api"]);
+        assert_eq!(
+            &calls[4].0[calls[4].0.len() - 4..],
+            ["rm", "--stop", "--force", "api"]
         );
     }
 

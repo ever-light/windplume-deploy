@@ -15,6 +15,8 @@ section{margin-bottom:34px}
 .card:hover{border-color:#aab8ed}
 .card-head,.section-head,.actions{display:flex;justify-content:space-between;align-items:center;gap:12px}
 .kv{display:grid;grid-template-columns:82px 1fr;gap:7px;margin-top:15px}
+.update-grid{display:grid;grid-template-columns:110px 1fr;gap:8px;margin-top:15px;background:white;border:1px solid var(--line);border-radius:10px;padding:16px}
+.update-grid span{color:var(--muted)}
 .kv span:nth-child(odd){color:var(--muted)}
 code{word-break:break-all;font-size:12px}
 .pill{display:inline-block;border-radius:999px;padding:3px 9px;background:#344054;color:white;font-size:12px}
@@ -24,6 +26,7 @@ code{word-break:break-all;font-size:12px}
 .muted{color:var(--muted)}
 button{border:1px solid #d0d5dd;background:white;padding:8px 13px;border-radius:7px;cursor:pointer}
 button.primary{background:var(--brand);border-color:var(--brand);color:white}
+button.danger{border-color:#fda29b;color:var(--danger)}
 button:disabled{opacity:.45;cursor:not-allowed}
 .table-wrap{overflow:auto;background:white;border:1px solid var(--line);border-radius:10px;margin-top:12px}
 table{width:100%;border-collapse:collapse;min-width:700px}
