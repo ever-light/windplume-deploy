@@ -80,7 +80,6 @@ async fn main() -> anyhow::Result<()> {
     };
     deployment::rebuild_override(&state).await?;
     let listener = tokio::net::TcpListener::bind(cfg.server.listen).await?;
-    state.updates.write_readiness().await?;
     let app = web::router(state)
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
             axum::http::header::AUTHORIZATION,

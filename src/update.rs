@@ -7,13 +7,14 @@ use sha2::{Digest, Sha256};
 use std::{
     io::Read,
     path::{Component, Path, PathBuf},
+    process::Command as StdCommand,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::{fs, process::Command, sync::RwLock, time::timeout};
+use tokio::{fs, sync::RwLock};
 
 const RELEASE_API: &str =
     "https://api.github.com/repos/ever-light/windplume-deploy/releases/latest";
@@ -23,6 +24,9 @@ const RELEASE_PAGE_PREFIX: &str = "https://github.com/ever-light/windplume-deplo
 const INSTALLED_UPDATE_ROOT: &str = "/var/lib/windplume-deploy";
 const INSTALLED_UPDATE_HELPER: &str = "/usr/local/libexec/windplume-deploy-update";
 const INSTALLED_UPDATE_PATH_UNIT: &str = "/etc/systemd/system/windplume-deploy-update.path";
+const INSTALLED_UPDATE_PUBLIC_KEY: &str = "/etc/windplume-deploy/release-signing-public.pem";
+const INSTALLED_UPDATE_STATUS: &str = "/var/lib/windplume-deploy/update-status/status.json";
+const UPDATE_PROTOCOL_VERSION: &str = "2";
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -41,6 +45,8 @@ pub struct ReleaseInfo {
     archive_url: String,
     #[serde(skip)]
     checksum_url: String,
+    #[serde(skip)]
+    signature_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -165,7 +171,7 @@ impl UpdateManager {
     }
 
     pub async fn status(&self) -> UpdateStatus {
-        let path = self.update_dir().join("status.json");
+        let path = self.status_file();
         if let Ok(bytes) = fs::read(path).await
             && let Ok(status) = serde_json::from_slice(&bytes)
         {
@@ -184,7 +190,6 @@ impl UpdateManager {
                 message: error.to_string(),
                 updated_at: Utc::now().to_rfc3339(),
             };
-            let _ = self.write_status(&status).await;
             *self.status.write().await = status;
             self.cancel();
             return;
@@ -192,7 +197,7 @@ impl UpdateManager {
 
         // A working path unit restarts this process. If it does not respond, release
         // maintenance mode so the running version remains usable.
-        for _ in 0..30 {
+        for _ in 0..90 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let status = self.status().await;
             if matches!(
@@ -212,7 +217,6 @@ impl UpdateManager {
                 message: "systemd 更新助手未响应，已取消维护状态".into(),
                 updated_at: Utc::now().to_rfc3339(),
             };
-            let _ = self.write_status(&status).await;
             *self.status.write().await = status;
             self.cancel();
         }
@@ -221,9 +225,10 @@ impl UpdateManager {
     async fn prepare(&self, release: &ReleaseInfo) -> Result<(), AppError> {
         self.set_status("downloading", Some(&release.version), "正在下载 Release")
             .await?;
-        let (archive, checksum) = tokio::try_join!(
+        let (archive, checksum, signature) = tokio::try_join!(
             self.download(&release.archive_url),
-            self.download(&release.checksum_url)
+            self.download(&release.checksum_url),
+            self.download(&release.signature_url)
         )?;
         let expected_name = format!("windplume-deploy-{}-linux-x86_64.tar.gz", release.version);
         let expected_sha = parse_checksum(&checksum, &expected_name)?;
@@ -239,33 +244,20 @@ impl UpdateManager {
             .await
             .map_err(|error| AppError::Update(error.to_string()))??;
         let update_dir = self.update_dir();
-        fs::create_dir_all(&update_dir).await?;
-        let candidate_path = update_dir.join("candidate");
-        write_atomic(&candidate_path, &candidate).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&candidate_path, std::fs::Permissions::from_mode(0o755)).await?;
-        }
-        let output = timeout(
-            Duration::from_secs(10),
-            Command::new(&candidate_path).arg("--version").output(),
-        )
-        .await
-        .map_err(|_| AppError::Update("候选二进制版本检查超时".into()))?
-        .map_err(|error| AppError::Update(format!("无法执行候选二进制: {error}")))?;
-        let version_output = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !version_output.contains(&release.version) {
-            return Err(AppError::Update("候选二进制版本不匹配".into()));
-        }
-        write_atomic(&update_dir.join("candidate.sha256"), actual_sha.as_bytes()).await?;
         self.set_status(
             "ready",
             Some(&release.version),
             "校验完成，等待 systemd 更新助手",
         )
         .await?;
-        write_atomic(&update_dir.join("request"), release.version.as_bytes()).await?;
+        stage_update(
+            &update_dir,
+            &candidate,
+            actual_sha.as_bytes(),
+            &signature,
+            &release.version,
+        )
+        .await?;
         Ok(())
     }
 
@@ -313,40 +305,38 @@ impl UpdateManager {
             message: message.into(),
             updated_at: Utc::now().to_rfc3339(),
         };
-        self.write_status(&status).await?;
         *self.status.write().await = status;
         Ok(())
-    }
-
-    async fn write_status(&self, status: &UpdateStatus) -> Result<(), AppError> {
-        write_atomic(
-            &self.update_dir().join("status.json"),
-            &serde_json::to_vec(status).map_err(|error| AppError::Internal(error.to_string()))?,
-        )
-        .await
-        .map_err(Into::into)
     }
 
     fn update_dir(&self) -> PathBuf {
         self.data_dir.join("update")
     }
 
-    pub async fn write_readiness(&self) -> anyhow::Result<()> {
-        let value = serde_json::json!({
-            "version": BUILD_VERSION,
-            "ready_at": Utc::now().to_rfc3339()
-        });
-        write_atomic(
-            &self.update_dir().join("ready.json"),
-            &serde_json::to_vec(&value)?,
-        )
-        .await?;
-        Ok(())
+    fn status_file(&self) -> PathBuf {
+        if self.data_dir == Path::new(INSTALLED_UPDATE_ROOT) {
+            PathBuf::from(INSTALLED_UPDATE_STATUS)
+        } else {
+            self.update_dir().join("status.json")
+        }
     }
 }
 
 fn update_helper_installed() -> bool {
-    Path::new(INSTALLED_UPDATE_HELPER).is_file() && Path::new(INSTALLED_UPDATE_PATH_UNIT).is_file()
+    Path::new(INSTALLED_UPDATE_HELPER).is_file()
+        && Path::new(INSTALLED_UPDATE_PATH_UNIT).is_file()
+        && Path::new(INSTALLED_UPDATE_PUBLIC_KEY).is_file()
+        && helper_protocol_matches(Path::new(INSTALLED_UPDATE_HELPER))
+}
+
+fn helper_protocol_matches(helper: &Path) -> bool {
+    StdCommand::new(helper)
+        .arg("--protocol-version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == UPDATE_PROTOCOL_VERSION
+        })
 }
 
 fn parse_release(release: GitHubRelease) -> Result<ReleaseInfo, AppError> {
@@ -357,13 +347,17 @@ fn parse_release(release: GitHubRelease) -> Result<ReleaseInfo, AppError> {
         .tag_name
         .strip_prefix('v')
         .unwrap_or(&release.tag_name);
-    Version::parse(version)
+    let parsed = Version::parse(version)
         .map_err(|_| AppError::Update(format!("Release 版本号无效: {}", release.tag_name)))?;
-    if !release.html_url.starts_with(RELEASE_PAGE_PREFIX) {
+    if !parsed.pre.is_empty() || !parsed.build.is_empty() {
+        return Err(AppError::Update("Release 版本必须是稳定的 X.Y.Z".into()));
+    }
+    if release.html_url != format!("{RELEASE_PAGE_PREFIX}v{version}") {
         return Err(AppError::Update("Release 页面地址不受信任".into()));
     }
     let archive_name = format!("windplume-deploy-{version}-linux-x86_64.tar.gz");
     let checksum_name = format!("{archive_name}.sha256");
+    let signature_name = format!("windplume-deploy-{version}-linux-x86_64.sig");
     let archive_url = release
         .assets
         .iter()
@@ -376,8 +370,15 @@ fn parse_release(release: GitHubRelease) -> Result<ReleaseInfo, AppError> {
         .find(|asset| asset.name == checksum_name)
         .map(|asset| asset.browser_download_url.clone())
         .ok_or_else(|| AppError::Update(format!("Release 缺少资产 {checksum_name}")))?;
-    if !archive_url.starts_with(RELEASE_DOWNLOAD_PREFIX)
-        || !checksum_url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+    let signature_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == signature_name)
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| AppError::Update(format!("Release 缺少资产 {signature_name}")))?;
+    if archive_url != format!("{RELEASE_DOWNLOAD_PREFIX}v{version}/{archive_name}")
+        || checksum_url != format!("{RELEASE_DOWNLOAD_PREFIX}v{version}/{checksum_name}")
+        || signature_url != format!("{RELEASE_DOWNLOAD_PREFIX}v{version}/{signature_name}")
     {
         return Err(AppError::Update("Release 资产地址不受信任".into()));
     }
@@ -387,6 +388,7 @@ fn parse_release(release: GitHubRelease) -> Result<ReleaseInfo, AppError> {
         published_at: release.published_at,
         archive_url,
         checksum_url,
+        signature_url,
     })
 }
 
@@ -456,6 +458,31 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(temporary, path).await
 }
 
+async fn stage_update(
+    update_dir: &Path,
+    candidate: &[u8],
+    checksum: &[u8],
+    signature: &[u8],
+    version: &str,
+) -> std::io::Result<()> {
+    fs::create_dir_all(update_dir).await?;
+    match fs::remove_file(update_dir.join("request")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let candidate_path = update_dir.join("candidate");
+    write_atomic(&candidate_path, candidate).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&candidate_path, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    write_atomic(&update_dir.join("candidate.sha256"), checksum).await?;
+    write_atomic(&update_dir.join("candidate.sig"), signature).await?;
+    write_atomic(&update_dir.join("request"), version.as_bytes()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +510,12 @@ mod tests {
                         "{RELEASE_DOWNLOAD_PREFIX}v{version}/{archive}.sha256"
                     ),
                 },
+                GitHubAsset {
+                    name: format!("windplume-deploy-{version}-linux-x86_64.sig"),
+                    browser_download_url: format!(
+                        "{RELEASE_DOWNLOAD_PREFIX}v{version}/windplume-deploy-{version}-linux-x86_64.sig"
+                    ),
+                },
             ],
         }
     }
@@ -492,9 +525,14 @@ mod tests {
         let release = parse_release(github_release("0.1.42")).unwrap();
         assert_eq!(release.version, "0.1.42");
         assert!(release.archive_url.ends_with("0.1.42-linux-x86_64.tar.gz"));
+        assert!(release.signature_url.ends_with("0.1.42-linux-x86_64.sig"));
+        let mut missing_signature = github_release("0.1.43");
+        missing_signature.assets.pop();
+        assert!(parse_release(missing_signature).is_err());
         let mut prerelease = github_release("0.2.0");
         prerelease.prerelease = true;
         assert!(parse_release(prerelease).is_err());
+        assert!(parse_release(github_release("0.2.0+build.1")).is_err());
     }
 
     #[test]
@@ -548,5 +586,49 @@ mod tests {
             .await
             .unwrap();
         assert!(!manager.is_active());
+    }
+
+    #[tokio::test]
+    async fn stages_signature_and_creates_request_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let update_dir = dir.path().join("update");
+        tokio::fs::create_dir_all(&update_dir).await.unwrap();
+        tokio::fs::write(update_dir.join("request"), "stale")
+            .await
+            .unwrap();
+        stage_update(
+            &update_dir,
+            b"candidate",
+            b"checksum",
+            b"signature",
+            "1.2.3",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(update_dir.join("candidate.sig"))
+                .await
+                .unwrap(),
+            b"signature"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(update_dir.join("request"))
+                .await
+                .unwrap(),
+            "1.2.3"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_old_update_helper_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helper");
+        std::fs::write(&helper, "#!/bin/sh\necho 1\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!helper_protocol_matches(&helper));
+        std::fs::write(&helper, "#!/bin/sh\necho 2\n").unwrap();
+        assert!(helper_protocol_matches(&helper));
     }
 }

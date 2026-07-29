@@ -1,6 +1,6 @@
 [package]
 name = "windplume-deploy"
-version = "0.1.0"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros", "chrono"] }
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

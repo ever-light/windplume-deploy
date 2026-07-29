@@ -1,1 +1,3 @@
 /target/
+/deploy/release-signing-private.pem
+/release-signing-private.pem

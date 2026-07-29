@@ -329,7 +329,8 @@ async fn system_update_status(State(state): State<AppState>) -> Json<crate::upda
 async fn start_update(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     if !state.updates.self_update_supported() {
         return Err(AppError::Update(
-            "当前不支持自更新，请确认为 Linux x86_64 且已安装更新助手".into(),
+            "当前不支持自更新：需 Linux x86_64，并需人工运行新版 install.sh 安装签名公钥和 v2 更新助手"
+                .into(),
         ));
     }
     let release = state.updates.latest(true).await?;

@@ -1,0 +1,55 @@
+name: Quality and security checks
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.96 --profile minimal --component clippy,rustfmt
+
+      - name: Restore Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: quality-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo +1.96 fmt --check
+
+      - name: Run Clippy
+        run: cargo +1.96 clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.96 test --locked --all-features
+
+      - name: Validate shell scripts
+        run: |
+          bash -n install.sh deploy/windplume-deploy-update tests/update-helper.sh
+          shellcheck install.sh deploy/windplume-deploy-update tests/update-helper.sh
+          sudo tests/update-helper.sh
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ github.token }}

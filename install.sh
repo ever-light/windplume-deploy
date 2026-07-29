@@ -23,10 +23,12 @@ fi
 update_path_source="${script_dir}/windplume-deploy-update.path"
 update_unit_source="${script_dir}/windplume-deploy-update.service"
 update_helper_source="${script_dir}/windplume-deploy-update"
+public_key_source="${script_dir}/release-signing-public.pem"
 if [[ ! -f "${update_path_source}" ]]; then
   update_path_source="${script_dir}/deploy/windplume-deploy-update.path"
   update_unit_source="${script_dir}/deploy/windplume-deploy-update.service"
   update_helper_source="${script_dir}/deploy/windplume-deploy-update"
+  public_key_source="${script_dir}/deploy/release-signing-public.pem"
 fi
 
 for source_file in \
@@ -35,19 +37,31 @@ for source_file in \
   "${unit_source}" \
   "${update_path_source}" \
   "${update_unit_source}" \
-  "${update_helper_source}"; do
+  "${update_helper_source}" \
+  "${public_key_source}"; do
   if [[ ! -f "${source_file}" ]]; then
     echo "安装包不完整，缺少文件：${source_file}" >&2
     exit 1
   fi
 done
 
-for command_name in chgrp chmod docker find getent groupadd id install sha256sum systemctl useradd usermod; do
+for command_name in chgrp chmod docker find getent groupadd id install openssl sed sha256sum systemctl useradd usermod; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "缺少必要命令：${command_name}" >&2
     exit 1
   fi
 done
+
+if ! openssl pkey -pubin -in "${public_key_source}" -noout >/dev/null 2>&1; then
+  echo "Release 签名公钥不是有效的 PEM 公钥：${public_key_source}" >&2
+  exit 1
+fi
+public_key_bits="$(openssl pkey -pubin -in "${public_key_source}" -text -noout 2>/dev/null | \
+  sed -n 's/.*Public-Key: (\([0-9][0-9]*\) bit).*/\1/p')"
+if [[ -z "${public_key_bits}" || "${public_key_bits}" -lt 3072 ]]; then
+  echo "Release 签名公钥必须是 RSA 3072 位或更高：${public_key_source}" >&2
+  exit 1
+fi
 
 if ! getent group docker >/dev/null; then
   echo "未找到 docker 用户组，请先安装并启动 Docker。" >&2
@@ -76,6 +90,9 @@ usermod --append --groups docker "${service_user}"
 
 install -d -o root -g "${service_group}" -m 0750 "${config_dir}"
 install -d -o "${service_user}" -g "${service_group}" -m 0750 "${data_dir}"
+install -d -o "${service_user}" -g "${service_group}" -m 0750 "${data_dir}/update"
+install -d -o root -g root -m 0700 "${data_dir}/update-root"
+install -d -o root -g "${service_group}" -m 0750 "${data_dir}/update-status"
 install -d -o root -g root -m 0755 /usr/local/libexec
 
 # Compose 项目默认部署在这里。服务需要遍历目录并读取 Compose、.env 和
@@ -96,6 +113,8 @@ install -o root -g root -m 0644 \
   "${update_unit_source}" "/etc/systemd/system/${service_name}-update.service"
 install -o root -g root -m 0755 \
   "${update_helper_source}" "/usr/local/libexec/${service_name}-update"
+install -o root -g root -m 0644 \
+  "${public_key_source}" "${config_dir}/release-signing-public.pem"
 
 if [[ ! -e "${config_dir}/config.yaml" ]]; then
   install -o root -g "${service_group}" -m 0640 \
@@ -121,3 +140,4 @@ echo "3. 公开 Docker Hub/GHCR 无需登录；需要认证时使用：sudo -H -
 echo "4. 启动服务：sudo systemctl start ${service_name}"
 echo "5. 查看状态：systemctl status ${service_name}"
 echo "6. 已启用 GitHub Release 手动自更新助手"
+echo "7. 自更新协议已启用独立 Release 签名验证"

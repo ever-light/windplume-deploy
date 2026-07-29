@@ -4,5 +4,18 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
+User=root
+Group=root
 ExecStart=/usr/local/libexec/windplume-deploy-update
 TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/usr/local/bin /usr/local/libexec /var/lib/windplume-deploy/update /var/lib/windplume-deploy/update-root /var/lib/windplume-deploy/update-status

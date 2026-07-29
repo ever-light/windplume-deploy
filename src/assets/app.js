@@ -374,7 +374,7 @@ async function loadSystemUpdate(refresh = false) {
       !data.self_update_supported || !data.update_available || active;
     if (!data.self_update_supported) {
       $("#update-status").textContent =
-        "自更新不可用（需 Linux x86_64 并先安装更新助手）";
+        "自更新不可用（需 Linux x86_64，并需运行新版 install.sh 安装签名公钥和 v2 更新助手）";
     }
     if (active && !systemUpdatePolling) pollSystemUpdate();
   } catch (error) {

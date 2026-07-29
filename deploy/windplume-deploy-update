@@ -1,101 +1,199 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-service_name="windplume-deploy"
-data_dir="/var/lib/windplume-deploy"
-update_dir="${data_dir}/update"
-request_file="${update_dir}/request"
-candidate_file="${update_dir}/candidate"
-checksum_file="${update_dir}/candidate.sha256"
-status_file="${update_dir}/status.json"
-ready_file="${update_dir}/ready.json"
-binary_file="/usr/local/bin/${service_name}"
-backup_file="/usr/local/libexec/${service_name}.previous"
+readonly protocol_version="2"
+readonly service_name="windplume-deploy"
+test_root="${WINDPLUME_UPDATE_TEST_ROOT:-}"
+if [[ -n "${test_root}" && ( "${WINDPLUME_UPDATE_TESTING:-}" != "1" || "${test_root}" != /tmp/* ) ]]; then
+  echo "测试根目录只允许在显式测试模式下使用 /tmp" >&2
+  exit 2
+fi
+readonly test_root
+readonly service_group="${WINDPLUME_UPDATE_SERVICE_GROUP:-windplume-deploy}"
+if [[ -z "${test_root}" ]]; then
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export PATH
+fi
+readonly data_dir="${test_root}/var/lib/windplume-deploy"
+readonly request_dir="${data_dir}/update"
+readonly root_dir="${data_dir}/update-root"
+readonly status_dir="${data_dir}/update-status"
+readonly request_file="${request_dir}/request"
+readonly candidate_file="${request_dir}/candidate"
+readonly checksum_file="${request_dir}/candidate.sha256"
+readonly signature_file="${request_dir}/candidate.sig"
+readonly status_file="${status_dir}/status.json"
+readonly public_key="${test_root}/etc/windplume-deploy/release-signing-public.pem"
+readonly binary_file="${test_root}/usr/local/bin/${service_name}"
+readonly backup_file="${test_root}/usr/local/libexec/${service_name}.previous"
+readonly max_candidate_bytes=$((100 * 1024 * 1024))
+readonly max_signature_bytes=$((16 * 1024))
+
+if [[ "${1:-}" == "--protocol-version" ]]; then
+  printf '%s\n' "${protocol_version}"
+  exit 0
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "不支持的参数" >&2
+  exit 2
+fi
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "更新助手必须以 root 运行" >&2
+  exit 1
+fi
+
+for command_name in chmod chown date install mktemp mv openssl rm seq sha256sum sleep stat systemctl; do
+  if ! command -v "${command_name}" >/dev/null 2>&1; then
+    echo "缺少必要命令：${command_name}" >&2
+    exit 1
+  fi
+done
+
 version="unknown"
 installed=false
+work_dir=""
 
 write_status() {
   local state="$1"
-  local version="$2"
+  local target_version="$2"
   local message="$3"
-  local temporary="${update_dir}/.status.$$.tmp"
+  local temporary
   local now
+  temporary="$(mktemp --tmpdir="${status_dir}" .status.XXXXXX)"
   now="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
   printf '{"state":"%s","target_version":"%s","message":"%s","updated_at":"%s"}\n' \
-    "${state}" "${version}" "${message}" "${now}" > "${temporary}"
-  chmod 0644 "${temporary}"
-  mv -f "${temporary}" "${status_file}"
+    "${state}" "${target_version}" "${message}" "${now}" > "${temporary}"
+  chown "root:${service_group}" "${temporary}"
+  chmod 0640 "${temporary}"
+  mv -f -- "${temporary}" "${status_file}"
 }
 
+cleanup_staged() {
+  rm -f -- "${request_file}" "${candidate_file}" "${checksum_file}" "${signature_file}"
+}
+
+# Called indirectly by the ERR trap.
+# shellcheck disable=SC2317
 unexpected_failure() {
   local exit_code="$?"
   trap - ERR
   if [[ "${installed}" == true && -f "${backup_file}" ]]; then
-    install -o root -g root -m 0755 "${backup_file}" "${binary_file}.new" || true
-    mv -f "${binary_file}.new" "${binary_file}" || true
-    rm -f "${ready_file}"
+    install -o root -g root -m 0755 -- "${backup_file}" "${binary_file}.new" || true
+    mv -f -- "${binary_file}.new" "${binary_file}" || true
     systemctl restart "${service_name}.service" || true
     write_status "rolled_back" "${version}" "更新助手异常，已恢复旧版本" || true
   else
     write_status "failed" "${version}" "更新助手执行失败" || true
   fi
-  rm -f "${request_file}"
+  cleanup_staged || true
+  [[ -z "${work_dir}" ]] || rm -rf -- "${work_dir}"
   exit "${exit_code}"
 }
 
 trap unexpected_failure ERR
 
 fail_staged_update() {
-  local version="$1"
+  local target_version="$1"
   local message="$2"
-  write_status "failed" "${version}" "${message}"
-  rm -f "${request_file}"
+  write_status "failed" "${target_version}" "${message}"
+  cleanup_staged
   trap - ERR
+  [[ -z "${work_dir}" ]] || rm -rf -- "${work_dir}"
   exit 1
 }
 
-if [[ ! -f "${request_file}" ]]; then
+version_is_newer() {
+  local candidate="$1"
+  local current="$2"
+  local candidate_major candidate_minor candidate_patch
+  local current_major current_minor current_patch
+  IFS=. read -r candidate_major candidate_minor candidate_patch <<< "${candidate}"
+  IFS=. read -r current_major current_minor current_patch <<< "${current}"
+  (( 10#${candidate_major} > 10#${current_major} )) && return 0
+  (( 10#${candidate_major} < 10#${current_major} )) && return 1
+  (( 10#${candidate_minor} > 10#${current_minor} )) && return 0
+  (( 10#${candidate_minor} < 10#${current_minor} )) && return 1
+  (( 10#${candidate_patch} > 10#${current_patch} ))
+}
+
+if [[ ! -f "${request_file}" || -L "${request_file}" ]]; then
   exit 0
 fi
 
-version="$(tr -d '[:space:]' < "${request_file}")"
-if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+version="$(<"${request_file}")"
+if [[ ! "${version}" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
   fail_staged_update "unknown" "更新请求版本无效"
 fi
-if [[ ! -f "${candidate_file}" || ! -f "${checksum_file}" ]]; then
-  fail_staged_update "${version}" "更新暂存文件不完整"
+
+for staged_file in "${candidate_file}" "${checksum_file}" "${signature_file}"; do
+  if [[ ! -f "${staged_file}" || -L "${staged_file}" ]]; then
+    fail_staged_update "${version}" "更新暂存文件不完整或类型不安全"
+  fi
+done
+if [[ ! -f "${public_key}" || -L "${public_key}" ]] || \
+   [[ "$(stat -c '%U:%a' -- "${public_key}")" != "root:644" ]]; then
+  fail_staged_update "${version}" "Release 签名公钥权限无效"
 fi
 
-checksum="$(tr -d '[:space:]' < "${checksum_file}")"
+candidate_size="$(stat -c '%s' -- "${candidate_file}")"
+signature_size="$(stat -c '%s' -- "${signature_file}")"
+if (( candidate_size == 0 || candidate_size > max_candidate_bytes )); then
+  fail_staged_update "${version}" "候选二进制大小无效"
+fi
+if (( signature_size == 0 || signature_size > max_signature_bytes )); then
+  fail_staged_update "${version}" "候选签名大小无效"
+fi
+
+current_output="$("${binary_file}" --version)"
+if [[ ! "${current_output}" =~ ^windplume-deploy\ ([0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9})$ ]]; then
+  fail_staged_update "${version}" "当前程序版本无效"
+fi
+current_version="${BASH_REMATCH[1]}"
+if ! version_is_newer "${version}" "${current_version}"; then
+  fail_staged_update "${version}" "拒绝安装相同或更低版本"
+fi
+
+work_dir="$(mktemp -d --tmpdir="${root_dir}" update.XXXXXX)"
+chmod 0700 "${work_dir}"
+install -o root -g root -m 0755 -- "${candidate_file}" "${work_dir}/candidate"
+install -o root -g root -m 0600 -- "${signature_file}" "${work_dir}/candidate.sig"
+if (( $(stat -c '%s' -- "${work_dir}/candidate") > max_candidate_bytes )); then
+  fail_staged_update "${version}" "复制后的候选二进制大小无效"
+fi
+
+checksum="$(<"${checksum_file}")"
 if [[ ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
   fail_staged_update "${version}" "候选二进制校验值无效"
 fi
-if ! printf '%s  %s\n' "${checksum}" "${candidate_file}" | sha256sum --check --status; then
+if ! printf '%s  %s\n' "${checksum}" "${work_dir}/candidate" | sha256sum --check --status; then
   fail_staged_update "${version}" "候选二进制 SHA-256 校验失败"
 fi
-if ! candidate_version="$("${candidate_file}" --version 2>/dev/null)" || \
-   [[ "${candidate_version}" != *"${version}"* ]]; then
+if ! openssl dgst -sha256 -verify "${public_key}" \
+    -signature "${work_dir}/candidate.sig" "${work_dir}/candidate" >/dev/null 2>&1; then
+  fail_staged_update "${version}" "候选二进制 Release 签名无效"
+fi
+
+candidate_output="$("${work_dir}/candidate" --version)"
+if [[ "${candidate_output}" != "windplume-deploy ${version}" ]]; then
   fail_staged_update "${version}" "候选二进制版本不匹配"
 fi
 
 write_status "installing" "${version}" "正在安装并重启管理服务"
-sleep 2
-install -o root -g root -m 0755 "${binary_file}" "${backup_file}"
-install -o root -g root -m 0755 "${candidate_file}" "${binary_file}.new"
-mv -f "${binary_file}.new" "${binary_file}"
+install -o root -g root -m 0755 -- "${binary_file}" "${backup_file}"
+install -o root -g root -m 0755 -- "${work_dir}/candidate" "${binary_file}.new"
+mv -f -- "${binary_file}.new" "${binary_file}"
 installed=true
-rm -f "${ready_file}"
 
 if systemctl restart "${service_name}.service"; then
   for _attempt in $(seq 1 30); do
     if systemctl is-active --quiet "${service_name}.service" && \
-       [[ -f "${ready_file}" ]] && \
-       grep -Fq "\"version\":\"${version}\"" "${ready_file}"; then
+       [[ "$("${binary_file}" --version)" == "windplume-deploy ${version}" ]]; then
       sleep 5
-      if systemctl is-active --quiet "${service_name}.service" && \
-         grep -Fq "\"version\":\"${version}\"" "${ready_file}"; then
+      if systemctl is-active --quiet "${service_name}.service"; then
         write_status "succeeded" "${version}" "更新成功"
-        rm -f "${request_file}" "${candidate_file}" "${checksum_file}"
+        cleanup_staged
+        rm -rf -- "${work_dir}"
+        trap - ERR
         exit 0
       fi
     fi
@@ -104,11 +202,11 @@ if systemctl restart "${service_name}.service"; then
 fi
 
 write_status "rolling_back" "${version}" "新版本启动失败，正在恢复旧版本"
-install -o root -g root -m 0755 "${backup_file}" "${binary_file}.new"
-mv -f "${binary_file}.new" "${binary_file}"
-rm -f "${ready_file}"
+install -o root -g root -m 0755 -- "${backup_file}" "${binary_file}.new"
+mv -f -- "${binary_file}.new" "${binary_file}"
 systemctl restart "${service_name}.service" || true
 write_status "rolled_back" "${version}" "新版本启动失败，已恢复旧版本"
-rm -f "${request_file}" "${candidate_file}" "${checksum_file}"
+cleanup_staged
+rm -rf -- "${work_dir}"
 trap - ERR
 exit 1

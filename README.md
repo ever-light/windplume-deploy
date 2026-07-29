@@ -138,8 +138,10 @@ systemd 服务，但不会在配置完成前启动服务。安装脚本还会启
 ## 程序自更新
 
 页面从固定的公开 GitHub 仓库检查最新稳定 Release，仅在用户确认后更新。
-更新前会校验 asset 名称、SemVer、SHA-256 和候选二进制报告的版本。
-SHA-256 只是完整性校验，不是独立的代码签名。
+更新前会校验 asset 名称、稳定 SemVer 和 archive SHA-256。普通服务进程只负责
+下载并暂存文件，不会执行尚未授权的候选二进制。root 更新助手会先把候选文件复制
+到 root 私有目录，使用安装时固定的 RSA 公钥验证独立 Release 签名，再校验候选
+二进制报告的精确版本；未通过签名验证的文件不会以 root 身份执行。
 
 替换 `/usr/local/bin/windplume-deploy` 和重启由 root 运行的独立 systemd unit
 完成。新版本未能就绪时，助手会恢复旧二进制并重启。Deploy 页面会短暂
@@ -147,9 +149,27 @@ SHA-256 只是完整性校验，不是独立的代码签名。
 已安装环境的更新控制文件固定位于 `/var/lib/windplume-deploy/update`，
 不受业务状态的 `storage.data_dir` 自定义值影响。
 
-首次启用自更新必须人工执行一次包含更新助手的新版 `install.sh`。
+首次启用自更新，或从 v1 更新助手迁移到签名协议 v2，必须人工执行一次包含
+更新助手和 Release 公钥的新版 `install.sh`。
 后续常规版本可从页面更新。自更新只替换主二进制；若 Release 说明要求更新
 systemd 或 helper 协议，需再次人工执行安装脚本。
+
+## 发布与签名
+
+普通 push 和 Pull Request 只运行格式、Clippy、测试、ShellCheck 和依赖漏洞审计。
+发布前先把 `Cargo.toml` 的版本更新为稳定的 `X.Y.Z`，然后推送完全匹配的
+`vX.Y.Z` 标签。标签与 Cargo 版本不一致时，发布工作流会拒绝执行。
+
+Release 签名使用 RSA 3072 位或更高密钥。公钥保存在
+`deploy/release-signing-public.pem` 并随安装包部署到
+`/etc/windplume-deploy/release-signing-public.pem`；私钥不得进入仓库，应配置在
+GitHub `release` Environment 的 `RELEASE_SIGNING_PRIVATE_KEY_PEM` Secret 中。
+发布工作流会先确认私钥与仓库公钥匹配，再对最终二进制生成
+`windplume-deploy-X.Y.Z-linux-x86_64.sig`。
+
+轮换密钥时，先通过人工安装包部署包含新公钥的版本，再用新私钥发布后续版本。
+不要仅通过网页更新同时更换信任公钥。若更新失败且自动回退也失败，可从可信
+Release 重新下载安装包、人工核对 SHA-256 和签名后再次运行 `install.sh`。
 
 公开 Docker Hub 和公开 GHCR 的 tag 查询及镜像拉取通常不需要 Token。如果
 Registry 需要认证，请使用服务用户登录；服务会从该用户的 Docker 配置中读取

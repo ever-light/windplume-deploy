@@ -1,0 +1,6 @@
+[advisories]
+# sqlx-macros-core declares every database backend in its package metadata, so
+# Cargo.lock contains the vulnerable RSA crate through the optional MySQL
+# backend. This project enables SQLite only; `cargo tree -i rsa` is empty and
+# the RSA crate is not compiled into the application.
+ignore = ["RUSTSEC-2023-0071"]
