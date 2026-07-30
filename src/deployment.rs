@@ -6,7 +6,11 @@ use crate::{
     storage::Deployment,
 };
 use chrono::Utc;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Write as _,
+    time::Duration,
+};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -171,6 +175,7 @@ async fn run_lifecycle(
         }
         Err(error) => {
             log.push_str(&format!("\n操作失败: {error}\n"));
+            append_container_logs(&state, &project, &service, &mut log).await;
             if let Err(storage_error) = state
                 .storage
                 .finish_failure(&item.id, &error.to_string(), "unavailable", &log)
@@ -195,12 +200,14 @@ async fn execute_lifecycle(
     match action {
         LifecycleAction::Recreate => {
             rebuild_project_override(state, project).await?;
+            begin_log_step(log, "重建容器");
             log.push_str(
                 &runtime
                     .compose
                     .recreate(&service.id, project.command_timeout())
                     .await?,
             );
+            begin_log_step(log, "检查容器状态");
             log.push_str(
                 &runtime
                     .compose
@@ -213,6 +220,7 @@ async fn execute_lifecycle(
             );
         }
         LifecycleAction::Stop => {
+            begin_log_step(log, "停止容器");
             log.push_str(
                 &runtime
                     .compose
@@ -221,6 +229,7 @@ async fn execute_lifecycle(
             );
         }
         LifecycleAction::Down => {
+            begin_log_step(log, "下线容器");
             log.push_str(
                 &runtime
                     .compose
@@ -287,7 +296,9 @@ async fn run(
             }
         }
         Err(error) => {
-            log.push_str(&format!("\n部署失败: {error}\n开始回退\n"));
+            log.push_str(&format!("\n部署失败: {error}\n"));
+            append_container_logs(&state, &project, &service, &mut log).await;
+            begin_log_step(&mut log, "开始回退");
             let rollback = rollback(&state, &project, &service, &mut log).await;
             let rollback_status = if rollback.is_ok() {
                 "succeeded"
@@ -321,18 +332,21 @@ async fn deploy_candidate(
     let mut versions = versions_from_db(state, project).await?;
     versions.insert(service.id.clone(), version.into());
     write_override(&runtime.override_file, &project.services, &versions).await?;
+    begin_log_step(log, "拉取镜像");
     log.push_str(
         &runtime
             .compose
             .pull(&service.id, project.command_timeout())
             .await?,
     );
+    begin_log_step(log, "启动容器");
     log.push_str(
         &runtime
             .compose
             .up(&service.id, project.command_timeout())
             .await?,
     );
+    begin_log_step(log, "检查容器状态");
     log.push_str(
         &runtime
             .compose
@@ -357,12 +371,14 @@ async fn rollback(
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
     let versions = versions_from_db(state, project).await?;
     write_override(&runtime.override_file, &project.services, &versions).await?;
+    begin_log_step(log, "恢复上一版本容器");
     log.push_str(
         &runtime
             .compose
             .up(&service.id, project.command_timeout())
             .await?,
     );
+    begin_log_step(log, "检查回退后的容器状态");
     log.push_str(
         &runtime
             .compose
@@ -374,6 +390,49 @@ async fn rollback(
             .await?,
     );
     Ok(())
+}
+
+fn begin_log_step(log: &mut String, title: &str) {
+    if !log.is_empty() && !log.ends_with('\n') {
+        log.push('\n');
+    }
+    if !log.is_empty() {
+        log.push('\n');
+    }
+    let _ = writeln!(log, "== {title} ==");
+}
+
+async fn append_container_logs(
+    state: &AppState,
+    project: &ProjectConfig,
+    service: &ServiceConfig,
+    log: &mut String,
+) {
+    begin_log_step(log, "容器最近 50 行日志");
+    let Some(runtime) = state.project_runtime(&project.id) else {
+        log.push_str("无法读取容器日志：Compose 项目运行时不存在\n");
+        return;
+    };
+    match runtime
+        .compose
+        .logs(
+            &service.id,
+            50,
+            Duration::from_secs(30).min(project.command_timeout()),
+        )
+        .await
+    {
+        Ok(output) if output.trim().is_empty() => log.push_str("（容器暂无日志）\n"),
+        Ok(output) => {
+            log.push_str(&output);
+            if !log.ends_with('\n') {
+                log.push('\n');
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(log, "无法读取容器日志：{error}");
+        }
+    }
 }
 
 pub async fn rebuild_project_override(
@@ -546,6 +605,9 @@ mod tests {
         let stored = state.storage.deployment(&item.id).await.unwrap().unwrap();
         assert_eq!(stored.status, "succeeded");
         assert_eq!(stored.rollback_status.as_deref(), Some("not_needed"));
+        assert!(stored.command_log.contains("== 拉取镜像 =="));
+        assert!(stored.command_log.contains("容器状态：running"));
+        assert!(!stored.command_log.contains(inspect));
         assert_eq!(
             state
                 .storage
@@ -566,6 +628,7 @@ mod tests {
             &dir,
             vec![
                 output(false, "candidate failed"),
+                output(true, "application panic\n"),
                 output(true, "rollback up"),
                 output(true, "container\n"),
                 output(true, inspect),
@@ -586,6 +649,9 @@ mod tests {
         let stored = state.storage.deployment(&item.id).await.unwrap().unwrap();
         assert_eq!(stored.status, "failed");
         assert_eq!(stored.rollback_status.as_deref(), Some("succeeded"));
+        assert!(stored.command_log.contains("== 容器最近 50 行日志 =="));
+        assert!(stored.command_log.contains("application panic"));
+        assert!(!stored.command_log.contains(inspect));
         assert!(
             state
                 .storage
@@ -594,6 +660,48 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn container_log_failure_does_not_hide_original_deploy_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = r#"[{"Config":{"Image":"base:latest","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
+        let (state, project, service) = state(
+            &dir,
+            vec![
+                output(false, "candidate failed"),
+                output(false, "logs unavailable"),
+                output(true, "rollback up"),
+                output(true, "container\n"),
+                output(true, inspect),
+            ],
+        )
+        .await;
+        let item = queued();
+        state.storage.create_deployment(&item).await.unwrap();
+        let permit = state
+            .project_runtime("app")
+            .unwrap()
+            .deploy_lock
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        run(state.clone(), project, service, item.clone(), permit).await;
+
+        let stored = state.storage.deployment(&item.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "failed");
+        assert!(
+            stored
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("candidate failed")
+        );
+        assert!(stored.command_log.contains("无法读取容器日志"));
+        assert!(stored.command_log.contains("logs unavailable"));
+        assert!(!stored.command_log.contains(inspect));
     }
 
     #[tokio::test]
@@ -655,6 +763,7 @@ mod tests {
             assert_eq!(stored.status, "succeeded");
             assert_eq!(stored.operation, action.as_str());
             assert_eq!(stored.rollback_status.as_deref(), Some("not_needed"));
+            assert!(!stored.command_log.contains(inspect));
         }
 
         assert_eq!(

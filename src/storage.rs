@@ -39,6 +39,20 @@ pub struct Deployment {
     pub rollback_status: Option<String>,
 }
 
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct DeploymentSummary {
+    pub id: String,
+    pub project_id: String,
+    pub service_id: String,
+    pub operation: String,
+    pub previous_version: Option<String>,
+    pub target_version: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub rollback_status: Option<String>,
+}
+
 impl Storage {
     pub async fn open(
         data_dir: &Path,
@@ -142,8 +156,8 @@ impl Storage {
             .bind(Utc::now().to_rfc3339()).bind(truncate_utf8(log, self.max_log_bytes)).bind(id).execute(&self.pool).await?;
         Ok(())
     }
-    pub async fn deployments(&self, limit: u32) -> Result<Vec<Deployment>, sqlx::Error> {
-        sqlx::query_as("SELECT * FROM deployments ORDER BY started_at DESC LIMIT ?")
+    pub async fn deployments(&self, limit: u32) -> Result<Vec<DeploymentSummary>, sqlx::Error> {
+        sqlx::query_as("SELECT id,project_id,service_id,operation,previous_version,target_version,status,started_at,finished_at,rollback_status FROM deployments ORDER BY started_at DESC LIMIT ?")
             .bind(limit.min(self.history_limit))
             .fetch_all(&self.pool)
             .await
@@ -153,6 +167,15 @@ impl Storage {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
+    }
+    pub async fn delete_deployments_before(&self, cutoff: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM deployments WHERE status NOT IN ('queued','running') AND datetime(started_at) < datetime(?)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
     async fn prune(&self) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM deployments WHERE id IN (SELECT id FROM deployments ORDER BY started_at DESC LIMIT -1 OFFSET ?)")
@@ -256,6 +279,36 @@ mod tests {
                 .desired_version,
             "2.0.0"
         );
+    }
+
+    #[tokio::test]
+    async fn deletes_only_finished_history_older_than_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        for (id, status, started_at) in [
+            ("old", "succeeded", "2026-01-01T00:00:00Z"),
+            ("active", "running", "2026-01-01T00:00:00Z"),
+            ("recent", "failed", "2026-03-01T00:00:00Z"),
+        ] {
+            sqlx::query("INSERT INTO deployments(id,project_id,service_id,operation,target_version,status,started_at,command_log) VALUES(?, 'app', 'api', 'deploy', '1.0.0', ?, ?, '')")
+                .bind(id)
+                .bind(status)
+                .bind(started_at)
+                .execute(&storage.pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            storage
+                .delete_deployments_before("2026-02-01T00:00:00Z")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(storage.deployment("old").await.unwrap().is_none());
+        assert!(storage.deployment("active").await.unwrap().is_some());
+        assert!(storage.deployment("recent").await.unwrap().is_some());
     }
 
     #[tokio::test]

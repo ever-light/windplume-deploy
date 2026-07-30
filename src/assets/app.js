@@ -5,6 +5,7 @@ let latestVersion = null;
 let latestSystemRelease = null;
 let systemUpdatePolling = false;
 let diagnostics = [];
+let containerLogsRequest = 0;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -133,7 +134,7 @@ async function selectService(projectId, serviceId, refresh = false) {
   $("#versions-section").hidden = false;
   $("#versions-title").textContent = `${project.id} / ${service.id} · 可部署版本`;
   $("#versions-source").textContent = `版本来源：${service.version_source}`;
-  $("#versions").innerHTML = '<tr><td colspan="4">正在读取…</td></tr>';
+  $("#versions").innerHTML = '<tr><td colspan="2">正在读取…</td></tr>';
   latestVersion = null;
   $("#deploy-latest").disabled = true;
   try {
@@ -152,18 +153,16 @@ async function selectService(projectId, serviceId, refresh = false) {
         .map(
           (version) => `<tr>
             <td><strong>${esc(version.version)}</strong>${version.version === service.desired_version ? ' <span class="pill ok">当前</span>' : ""}</td>
-            <td>${version.updated_at ? new Date(version.updated_at).toLocaleString() : "—"}</td>
-            <td><code>${esc(version.digest)}</code></td>
             <td><button class="deploy" data-version="${esc(version.version)}" ${project.deployment_in_progress || version.version === service.desired_version ? "disabled" : ""}>部署</button></td>
           </tr>`,
         )
-        .join("") || '<tr><td colspan="4">没有符合规则的标签</td></tr>';
+        .join("") || '<tr><td colspan="2">没有符合规则的标签</td></tr>';
     document.querySelectorAll(".deploy").forEach((button) => {
       button.onclick = () => confirmDeploy(button.dataset.version);
     });
   } catch (error) {
     diagnose(`${projectId} / ${serviceId} 版本查询`, error.message);
-    $("#versions").innerHTML = `<tr><td colspan="4" class="drift">${esc(error.message)}</td></tr>`;
+    $("#versions").innerHTML = `<tr><td colspan="2" class="drift">${esc(error.message)}</td></tr>`;
   }
 }
 
@@ -305,9 +304,9 @@ async function showDetail(id) {
   try {
     const deployment = await api(`/api/deployments/${id}`);
     $("#detail-summary").textContent =
-      `${deployment.project_id} / ${deployment.service_id}: ${operationLabel(deployment.operation)}${deployment.operation === "deploy" ? ` · ${deployment.previous_version || "未部署"} → ${deployment.target_version}` : ""} · ${deployment.status}` +
-      (deployment.error_message ? ` · ${deployment.error_message}` : "");
-    $("#detail-log").textContent = deployment.command_log || "（无日志）";
+      `${deployment.project_id} / ${deployment.service_id} · ${operationLabel(deployment.operation)}${deployment.operation === "deploy" ? ` · ${deployment.previous_version || "未部署"} → ${deployment.target_version}` : ""} · ${deployment.status}`;
+    $("#detail-log").textContent =
+      deployment.command_log || deployment.error_message || "（无日志）";
     $("#detail").showModal();
   } catch (error) {
     diagnose(`部署详情 ${id}`, error.message);
@@ -316,20 +315,72 @@ async function showDetail(id) {
 }
 
 async function showContainerLogs(projectId, serviceId) {
+  const content = $("#container-logs-content");
+  const requestId = ++containerLogsRequest;
+  let currentTail = 0;
+  let maxTail = 200;
+  let loading = false;
   $("#container-logs-summary").textContent =
-    `${projectId} / ${serviceId} · 最近 200 行`;
-  $("#container-logs-content").textContent = "正在读取…";
+    `${projectId} / ${serviceId} · 最近 50 行`;
+  content.textContent = "正在读取…";
   $("#container-logs").showModal();
+
+  const load = async (tail, preservePosition) => {
+    if (loading) return;
+    loading = true;
+    const previousHeight = content.scrollHeight;
+    const previousTop = content.scrollTop;
+    try {
+      const data = await api(
+        `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/logs?tail=${tail}`,
+      );
+      if (requestId !== containerLogsRequest) return;
+      content.textContent = data.logs || "（暂无日志）";
+      currentTail = data.tail;
+      maxTail = data.max_tail;
+      $("#container-logs-summary").textContent =
+        `${projectId} / ${serviceId} · 最近 ${data.tail} 行` +
+        (data.tail < data.max_tail
+          ? ` · 上滑到顶部继续加载（最多 ${data.max_tail} 行）`
+          : " · 已到加载上限");
+      content.scrollTop = preservePosition
+        ? content.scrollHeight - previousHeight + previousTop
+        : content.scrollHeight;
+    } catch (error) {
+      diagnose(`${projectId} / ${serviceId} 容器日志`, error.message);
+      if (currentTail === 0) {
+        content.textContent = `读取失败：${error.message}`;
+      } else {
+        toast(`继续加载日志失败：${error.message}`);
+      }
+    } finally {
+      loading = false;
+    }
+  };
+
+  content.onscroll = () => {
+    if (content.scrollTop <= 1 && currentTail > 0 && currentTail < maxTail) {
+      void load(currentTail === 50 ? 100 : maxTail, true);
+    }
+  };
+  await load(50, false);
+}
+
+async function cleanupHistory() {
+  if (!window.confirm("确定清除 30 天前已完成的操作记录吗？此操作不可恢复。")) {
+    return;
+  }
+  const button = $("#history-cleanup");
+  button.disabled = true;
   try {
-    const data = await api(
-      `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/logs`,
-    );
-    $("#container-logs-summary").textContent =
-      `${projectId} / ${serviceId} · 最近 ${data.tail} 行`;
-    $("#container-logs-content").textContent = data.logs || "（暂无日志）";
+    const result = await api("/api/deployments/cleanup", { method: "POST" });
+    toast(`已清除 ${result.deleted} 条旧操作记录`);
+    await loadHistory();
   } catch (error) {
-    diagnose(`${projectId} / ${serviceId} 容器日志`, error.message);
-    $("#container-logs-content").textContent = `读取失败：${error.message}`;
+    diagnose("清理操作历史", error.message);
+    toast(error.message);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -444,6 +495,7 @@ $("#refresh").onclick = () =>
 $("#deploy-latest").onclick = () =>
   latestVersion && confirmDeploy(latestVersion);
 $("#history-refresh").onclick = loadHistory;
+$("#history-cleanup").onclick = cleanupHistory;
 $("#update-check").onclick = () => loadSystemUpdate(true);
 $("#update-install").onclick = confirmSystemUpdate;
 $("#diagnostics-clear").onclick = () => {

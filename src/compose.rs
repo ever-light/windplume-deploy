@@ -276,7 +276,7 @@ impl Compose {
         &self,
         ids: &[String],
         limit: Duration,
-    ) -> anyhow::Result<(RuntimeState, String, bool)> {
+    ) -> anyhow::Result<(RuntimeState, bool)> {
         if ids.is_empty() {
             anyhow::bail!("Compose 未返回容器");
         }
@@ -285,7 +285,7 @@ impl Compose {
         let cwd = self.project().project_dir().to_path_buf();
         let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
-            anyhow::bail!("docker inspect 执行失败\n{}", out.log);
+            anyhow::bail!("docker inspect 执行失败");
         }
         let values: Vec<Inspect> = serde_json::from_str(&out.log)?;
         if values.len() != ids.len() {
@@ -318,7 +318,6 @@ impl Compose {
                 actual_image: image,
                 container_status: worst,
             },
-            out.log,
             ready,
         ))
     }
@@ -329,22 +328,18 @@ impl Compose {
         command_limit: Duration,
     ) -> anyhow::Result<String> {
         let deadline = Instant::now() + health_limit;
-        let mut log = String::new();
         loop {
-            let (ids, pslog) = self.ids(service, command_limit).await?;
-            log.push_str(&pslog);
+            let (ids, _) = self.ids(service, command_limit).await?;
             match self.inspect(&ids, command_limit).await {
-                Ok((_, inspect_log, true)) => {
-                    log.push_str(&inspect_log);
-                    return Ok(log);
+                Ok((state, true)) => {
+                    return Ok(format!("容器状态：{}\n", state.container_status));
                 }
-                Ok((state, inspect_log, false)) => {
-                    log.push_str(&inspect_log);
+                Ok((state, false)) => {
                     if matches!(
                         state.container_status.as_str(),
                         "unhealthy" | "exited" | "dead"
                     ) {
-                        anyhow::bail!("容器状态异常: {}\n{}", state.container_status, log);
+                        anyhow::bail!("容器状态异常: {}", state.container_status);
                     }
                 }
                 Err(e) => {
@@ -354,7 +349,7 @@ impl Compose {
                 }
             }
             if Instant::now() >= deadline {
-                anyhow::bail!("等待容器健康状态超时\n{log}");
+                anyhow::bail!("等待容器健康状态超时");
             }
             sleep(Duration::from_secs(2)).await;
         }
@@ -374,7 +369,7 @@ impl Compose {
         }
         self.inspect(&ids, limit)
             .await
-            .map(|x| x.0)
+            .map(|(state, _)| state)
             .unwrap_or(RuntimeState {
                 actual_image: None,
                 container_status: "unknown".into(),

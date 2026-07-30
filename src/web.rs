@@ -8,7 +8,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-const CONTAINER_LOG_TAIL: u32 = 200;
+const CONTAINER_LOG_DEFAULT_TAIL: u32 = 50;
+const CONTAINER_LOG_MAX_TAIL: u32 = 200;
+const HISTORY_RETENTION_DAYS: i64 = 30;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -36,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/system/update", get(system_update).post(start_update))
         .route("/api/system/update/status", get(system_update_status))
+        .route("/api/deployments/cleanup", post(cleanup_deployments))
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
         .route("/", get(index))
@@ -209,9 +212,15 @@ async fn lifecycle(
     ))
 }
 
+#[derive(Default, Deserialize)]
+struct LogQuery {
+    tail: Option<u32>,
+}
+
 async fn service_logs(
     State(state): State<AppState>,
     Path((project_id, service_id)): Path<(String, String)>,
+    Query(query): Query<LogQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let runtime = state
         .project_runtime(&project_id)
@@ -224,11 +233,15 @@ async fn service_logs(
     {
         return Err(AppError::NotFound);
     }
+    let tail = query
+        .tail
+        .unwrap_or(CONTAINER_LOG_DEFAULT_TAIL)
+        .clamp(1, CONTAINER_LOG_MAX_TAIL);
     let logs = runtime
         .compose
         .logs(
             &service_id,
-            CONTAINER_LOG_TAIL,
+            tail,
             std::time::Duration::from_secs(30).min(project.command_timeout()),
         )
         .await
@@ -244,7 +257,8 @@ async fn service_logs(
     Ok(Json(serde_json::json!({
         "project_id": project_id,
         "service_id": service_id,
-        "tail": CONTAINER_LOG_TAIL,
+        "tail": tail,
+        "max_tail": CONTAINER_LOG_MAX_TAIL,
         "logs": logs
     })))
 }
@@ -377,13 +391,27 @@ struct HistoryQuery {
 async fn deployments(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
-) -> Result<Json<Vec<crate::storage::Deployment>>, AppError> {
+) -> Result<Json<Vec<crate::storage::DeploymentSummary>>, AppError> {
     Ok(Json(
         state
             .storage
             .deployments(query.limit.unwrap_or(50).clamp(1, 500))
             .await?,
     ))
+}
+
+async fn cleanup_deployments(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(HISTORY_RETENTION_DAYS);
+    let deleted = state
+        .storage
+        .delete_deployments_before(&cutoff.to_rfc3339())
+        .await?;
+    Ok(Json(serde_json::json!({
+        "deleted": deleted,
+        "retention_days": HISTORY_RETENTION_DAYS
+    })))
 }
 
 async fn deployment(
@@ -584,6 +612,8 @@ mod tests {
         assert!(js.contains("/lifecycle"));
         assert!(js.contains("/api/system/update"));
         assert!(js.contains("重建当前版本"));
+        assert!(js.contains("currentTail === 50 ? 100 : maxTail"));
+        assert!(js.contains("/api/deployments/cleanup"));
 
         let index = app
             .clone()
@@ -599,6 +629,9 @@ mod tests {
         .unwrap();
         assert!(index.contains(">刷新版本</button>"));
         assert!(index.contains("系统更新"));
+        assert!(index.contains("清除 30 天前记录"));
+        assert!(!index.contains("<th>更新时间</th>"));
+        assert!(!index.contains("<th>Digest</th>"));
 
         let css = app
             .clone()
@@ -613,7 +646,7 @@ mod tests {
         )
         .unwrap();
         assert!(css.contains("width:min(61.8vw,1180px)"));
-        assert!(css.contains("#container-logs-content{height:55vh"));
+        assert!(css.contains(".log-dialog .log-content{height:55vh"));
 
         let rejected = app
             .clone()
@@ -637,6 +670,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_logs.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn container_logs_default_to_50_and_clamp_to_200_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let outputs = vec![
+            CommandOutput {
+                success: true,
+                log: "latest 50".into(),
+            },
+            CommandOutput {
+                success: true,
+                log: "latest 200".into(),
+            },
+        ];
+        let (state, runner) = refresh_state(&dir, outputs).await;
+        let app = router(state);
+
+        for (query, expected) in [("", 50_u64), ("?tail=500", 200_u64)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/projects/app/services/old/logs{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["tail"].as_u64(), Some(expected));
+            assert_eq!(body["max_tail"].as_u64(), Some(200));
+        }
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(calls[0].windows(2).any(|args| args == ["--tail", "50"]));
+        assert!(calls[1].windows(2).any(|args| args == ["--tail", "200"]));
     }
 
     #[tokio::test]
