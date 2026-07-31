@@ -12,6 +12,7 @@ let historyLoading = false;
 let systemResourcesLoading = false;
 let systemResourcesLoaded = false;
 let runtimeRefreshTimer = null;
+const PASSIVE_REFRESH_INTERVAL_MS = 60_000;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -126,22 +127,26 @@ async function loadSystemResources() {
     const systemDisk = overview.system_disk;
     const dataDisk = overview.data_disk;
     const sameDisk = systemDisk.mount_point === dataDisk.mount_point;
-    const systemDiskDetail = `挂载于 ${systemDisk.mount_point} · 已用 ${formatBytes(systemDisk.used_bytes)}，可用 ${formatBytes(systemDisk.available_bytes)}`;
-    const dataDiskDetail = sameDisk
-      ? `与系统盘相同 · 可用 ${formatBytes(dataDisk.available_bytes)}`
-      : `挂载于 ${dataDisk.mount_point} · 已用 ${formatBytes(dataDisk.used_bytes)}，可用 ${formatBytes(dataDisk.available_bytes)}`;
-    const memoryDetail = `可用 ${formatBytes(overview.memory.available_bytes)}`;
-    $("#system-metrics").innerHTML = [
+    const systemDiskDetail = `挂载于 ${systemDisk.mount_point}${sameDisk ? " · 数据目录共用此文件系统" : ""} · 已用 ${formatBytes(systemDisk.used_bytes)}，可用 ${formatBytes(systemDisk.available_bytes)}`;
+    const diskMetrics = [
       metric(
         "系统盘",
         `${systemDisk.used_percent.toFixed(0)}%`,
         systemDiskDetail,
       ),
-      metric(
-        "数据盘",
-        `${dataDisk.used_percent.toFixed(0)}%`,
-        dataDiskDetail,
-      ),
+    ];
+    if (!sameDisk) {
+      diskMetrics.push(
+        metric(
+          "数据盘",
+          `${dataDisk.used_percent.toFixed(0)}%`,
+          `挂载于 ${dataDisk.mount_point} · 已用 ${formatBytes(dataDisk.used_bytes)}，可用 ${formatBytes(dataDisk.available_bytes)}`,
+        ),
+      );
+    }
+    const memoryDetail = `可用 ${formatBytes(overview.memory.available_bytes)}`;
+    $("#system-metrics").innerHTML = [
+      ...diskMetrics,
       metric(
         "内存",
         `${overview.memory.used_percent.toFixed(0)}%`,
@@ -822,7 +827,7 @@ setInterval(() => {
     loadProjects();
     loadHistory();
   }
-}, 10000);
+}, PASSIVE_REFRESH_INTERVAL_MS);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     loadProjects();

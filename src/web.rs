@@ -14,7 +14,9 @@ use std::sync::Arc;
 const CONTAINER_LOG_DEFAULT_TAIL: u32 = 50;
 const CONTAINER_LOG_MAX_TAIL: u32 = 200;
 const HISTORY_RETENTION_DAYS: i64 = 30;
-const RUNTIME_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+// Keep this slightly below the browser's one-minute cadence so each scheduled
+// request can refresh Docker state despite request and command timing jitter.
+const RUNTIME_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(55);
 
 pub fn router(state: AppState) -> Router {
     let csrf = CsrfToken(Arc::from(uuid::Uuid::new_v4().simple().to_string()));
@@ -1036,6 +1038,7 @@ mod tests {
         assert!(js.contains("selectService(selected.project.id, selected.service.id, true)"));
         assert!(js.contains("/lifecycle"));
         assert!(js.contains("/api/system/update"));
+        assert!(js.contains("$(\"#update-check\").onclick = () => loadSystemUpdate(true)"));
         assert!(js.contains("重建当前版本"));
         assert!(js.contains("<span>部署版本</span>"));
         assert!(js.contains("<span>运行镜像</span>"));
@@ -1047,8 +1050,12 @@ mod tests {
         assert!(js.contains("/api/system/overview"));
         assert!(js.contains("/api/system/images/cleanup"));
         assert!(js.contains("/api/system/build-cache/cleanup"));
+        assert!(js.contains("if (!sameDisk)"));
+        assert!(js.contains("数据目录共用此文件系统"));
         assert!(js.contains("visibilitychange"));
         assert!(js.contains("project.runtime_refreshing"));
+        assert!(js.contains("const PASSIVE_REFRESH_INTERVAL_MS = 60_000"));
+        assert!(js.contains("}, PASSIVE_REFRESH_INTERVAL_MS);"));
 
         let index = app
             .clone()

@@ -28,7 +28,7 @@ const INSTALLED_UPDATE_PUBLIC_KEY: &str = "/etc/windplume-deploy/release-signing
 const INSTALLED_UPDATE_STATUS: &str = "/var/lib/windplume-deploy/update-status/status.json";
 const UPDATE_PROTOCOL_VERSION: &str = "3";
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
-const RELEASE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const RELEASE_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub const BUILD_VERSION: &str = match option_env!("WINDPLUME_BUILD_VERSION") {
     Some(version) => version,
