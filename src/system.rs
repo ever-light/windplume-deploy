@@ -2,7 +2,7 @@ use crate::compose::{CommandRunner, repositories_match};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -17,7 +17,8 @@ pub struct SystemManager {
 
 #[derive(Debug, Serialize)]
 pub struct SystemOverview {
-    pub disk: SpaceUsage,
+    pub system_disk: SpaceUsage,
+    pub data_disk: SpaceUsage,
     pub memory: SpaceUsage,
     pub swap: SpaceUsage,
     pub load_average: [f64; 3],
@@ -27,6 +28,7 @@ pub struct SystemOverview {
 
 #[derive(Debug, Default, Serialize)]
 pub struct SpaceUsage {
+    pub mount_point: String,
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
@@ -107,13 +109,8 @@ impl SystemManager {
     }
 
     pub async fn overview(&self) -> anyhow::Result<SystemOverview> {
-        let df = self
-            .run(&[
-                "-B1",
-                "--output=size,used,avail,pcent",
-                self.cwd.to_string_lossy().as_ref(),
-            ])
-            .await?;
+        let system_disk = self.run_df(Path::new("/")).await?;
+        let data_disk = self.run_df(&self.cwd).await?;
         let docker = self
             .run_docker(&["system", "df", "--format", "{{json .}}"])
             .await?;
@@ -124,7 +121,8 @@ impl SystemManager {
         )?;
         let (memory, swap) = parse_meminfo(&meminfo)?;
         Ok(SystemOverview {
-            disk: parse_df(&df)?,
+            system_disk,
+            data_disk,
             memory,
             swap,
             load_average: parse_loadavg(&loadavg)?,
@@ -160,11 +158,12 @@ impl SystemManager {
             .await
     }
 
-    async fn run(&self, args: &[&str]) -> anyhow::Result<String> {
-        let args = args
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>();
+    async fn run_df(&self, path: &Path) -> anyhow::Result<SpaceUsage> {
+        let args = vec![
+            "-B1".into(),
+            "--output=target,size,used,avail,pcent".into(),
+            path.to_string_lossy().into_owned(),
+        ];
         let output = self
             .runner
             .run("df", &args, &self.cwd, COMMAND_TIMEOUT)
@@ -172,7 +171,7 @@ impl SystemManager {
         if !output.success {
             anyhow::bail!("df 执行失败: {}", output.log.trim());
         }
-        Ok(output.log)
+        parse_df(&output.log)
     }
 
     async fn run_docker(&self, args: &[&str]) -> anyhow::Result<String> {
@@ -198,14 +197,15 @@ fn parse_df(value: &str) -> anyhow::Result<SpaceUsage> {
         .find(|line| !line.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("df 未返回磁盘信息"))?;
     let fields = line.split_whitespace().collect::<Vec<_>>();
-    if fields.len() != 4 {
+    if fields.len() != 5 {
         anyhow::bail!("df 返回格式无效");
     }
     Ok(SpaceUsage {
-        total_bytes: fields[0].parse()?,
-        used_bytes: fields[1].parse()?,
-        available_bytes: fields[2].parse()?,
-        used_percent: fields[3].trim_end_matches('%').parse()?,
+        mount_point: fields[0].replace("\\040", " "),
+        total_bytes: fields[1].parse()?,
+        used_bytes: fields[2].parse()?,
+        available_bytes: fields[3].parse()?,
+        used_percent: fields[4].trim_end_matches('%').parse()?,
     })
 }
 
@@ -226,6 +226,7 @@ fn parse_meminfo(value: &str) -> anyhow::Result<(SpaceUsage, SpaceUsage)> {
         let available = *fields.get(available_key).unwrap_or(&0);
         let used = total.saturating_sub(available);
         Ok(SpaceUsage {
+            mount_point: String::new(),
             total_bytes: total,
             used_bytes: used,
             available_bytes: available,
@@ -365,7 +366,9 @@ mod tests {
 
     #[test]
     fn parses_host_and_docker_space() {
-        let disk = parse_df("1B-blocks Used Available Use%\n1000 650 350 65%\n").unwrap();
+        let disk =
+            parse_df("Mounted on 1B-blocks Used Available Use%\n/ 1000 650 350 65%\n").unwrap();
+        assert_eq!(disk.mount_point, "/");
         assert_eq!(disk.available_bytes, 350);
         assert_eq!(disk.used_percent, 65.0);
 

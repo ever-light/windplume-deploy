@@ -49,6 +49,7 @@ for command_name in chmod chown date install mktemp mv openssl rm seq sleep stat
 done
 
 version="unknown"
+current_version="unknown"
 installed=false
 work_dir=""
 
@@ -65,6 +66,8 @@ write_status() {
   chown "root:${service_group}" "${temporary}"
   chmod 0640 "${temporary}"
   mv -f -- "${temporary}" "${status_file}"
+  printf 'windplume-deploy update [%s] target=%s: %s\n' \
+    "${state}" "${target_version}" "${message}" >&2
 }
 
 cleanup_staged() {
@@ -74,16 +77,45 @@ cleanup_staged() {
     "${signature_file}"
 }
 
+service_is_stable() {
+  local expected_version="$1"
+  local _attempt
+  for _attempt in $(seq 1 30); do
+    if systemctl is-active --quiet "${service_name}.service" && \
+       [[ "$("${binary_file}" --version 2>/dev/null)" == \
+          "windplume-deploy ${expected_version}" ]]; then
+      sleep 5
+      if systemctl is-active --quiet "${service_name}.service" && \
+         [[ "$("${binary_file}" --version 2>/dev/null)" == \
+            "windplume-deploy ${expected_version}" ]]; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+restore_previous() {
+  install -o root -g root -m 0755 -- "${backup_file}" "${binary_file}.new" || return 1
+  mv -f -- "${binary_file}.new" "${binary_file}" || return 1
+  systemctl restart "${service_name}.service" || return 1
+  service_is_stable "${current_version}"
+}
+
 # Called indirectly by the ERR trap.
 # shellcheck disable=SC2317
 unexpected_failure() {
   local exit_code="$?"
   trap - ERR
   if [[ "${installed}" == true && -f "${backup_file}" ]]; then
-    install -o root -g root -m 0755 -- "${backup_file}" "${binary_file}.new" || true
-    mv -f -- "${binary_file}.new" "${binary_file}" || true
-    systemctl restart "${service_name}.service" || true
-    write_status "rolled_back" "${version}" "更新助手异常，已恢复旧版本" || true
+    if restore_previous; then
+      write_status "rolled_back" "${version}" \
+        "更新助手异常，已恢复旧版本 ${current_version}" || true
+    else
+      write_status "failed" "${version}" \
+        "更新助手异常，旧版本也未能启动；请通过 SSH 查看 journalctl -u windplume-deploy.service -u windplume-deploy-update.service" || true
+    fi
   else
     write_status "failed" "${version}" "更新助手执行失败" || true
   fi
@@ -179,28 +211,22 @@ install -o root -g root -m 0755 -- "${work_dir}/candidate" "${binary_file}.new"
 mv -f -- "${binary_file}.new" "${binary_file}"
 installed=true
 
-if systemctl restart "${service_name}.service"; then
-  for _attempt in $(seq 1 30); do
-    if systemctl is-active --quiet "${service_name}.service" && \
-       [[ "$("${binary_file}" --version)" == "windplume-deploy ${version}" ]]; then
-      sleep 5
-      if systemctl is-active --quiet "${service_name}.service"; then
-        write_status "succeeded" "${version}" "更新成功"
-        cleanup_staged
-        rm -rf -- "${work_dir}"
-        trap - ERR
-        exit 0
-      fi
-    fi
-    sleep 1
-  done
+if systemctl restart "${service_name}.service" && service_is_stable "${version}"; then
+  write_status "succeeded" "${version}" "更新成功"
+  cleanup_staged
+  rm -rf -- "${work_dir}"
+  trap - ERR
+  exit 0
 fi
 
 write_status "rolling_back" "${version}" "新版本启动失败，正在恢复旧版本"
-install -o root -g root -m 0755 -- "${backup_file}" "${binary_file}.new"
-mv -f -- "${binary_file}.new" "${binary_file}"
-systemctl restart "${service_name}.service" || true
-write_status "rolled_back" "${version}" "新版本启动失败，已恢复旧版本"
+if restore_previous; then
+  write_status "rolled_back" "${version}" \
+    "新版本启动失败，已恢复旧版本 ${current_version}"
+else
+  write_status "failed" "${version}" \
+    "新版本和旧版本均未能启动；请通过 SSH 查看 journalctl -u windplume-deploy.service -u windplume-deploy-update.service"
+fi
 cleanup_staged
 rm -rf -- "${work_dir}"
 trap - ERR

@@ -1,7 +1,11 @@
 :root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e4e7ec;--bg:#f6f8fb;--brand:#3157d5;--danger:#b42318;--ok:#067647}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-header{background:#101828;color:white;padding:22px max(24px,calc((100% - 1180px)/2));display:flex;justify-content:space-between;align-items:center}
+header{background:#101828;color:white;padding:22px max(24px,calc((100% - 1180px)/2));display:flex;justify-content:space-between;align-items:center;gap:20px}
+.header-tools{display:flex;align-items:center;gap:14px}
+.top-tabs{display:flex;padding:3px;background:#1d2939;border-radius:9px}
+.top-tabs button{border:0;background:transparent;color:#d0d5dd;padding:7px 13px}
+.top-tabs button.active{background:white;color:#101828;box-shadow:0 1px 2px #0003}
 h1,h2,p{margin:0}
 h1{font-size:22px}
 header p{color:#98a2b3}
@@ -53,4 +57,4 @@ pre{white-space:pre-wrap;max-height:55vh;overflow:auto;background:#101828;color:
 .log-dialog{width:min(61.8vw,1180px);max-width:calc(100vw - 32px)}
 .log-dialog .log-content{height:55vh;max-height:55vh;margin-bottom:0}
 #toast{position:fixed;right:20px;bottom:20px;background:#101828;color:white;padding:10px 14px;border-radius:8px;display:none}
-@media(max-width:600px){header{padding:18px}main{padding:20px 12px}.cards{grid-template-columns:1fr}.project-head,.resource-subhead{align-items:flex-start;flex-direction:column}.metric-grid{grid-template-columns:1fr 1fr}.log-dialog{width:calc(100vw - 24px);max-width:calc(100vw - 24px)}.log-dialog .log-content{height:60vh;max-height:60vh}}
+@media(max-width:600px){header{padding:18px;align-items:flex-start;flex-direction:column}.header-tools{width:100%;justify-content:space-between}main{padding:20px 12px}.cards{grid-template-columns:1fr}.project-head,.resource-subhead{align-items:flex-start;flex-direction:column}.metric-grid{grid-template-columns:1fr 1fr}.log-dialog{width:calc(100vw - 24px);max-width:calc(100vw - 24px)}.log-dialog .log-content{height:60vh;max-height:60vh}}

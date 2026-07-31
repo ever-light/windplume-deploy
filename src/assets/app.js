@@ -10,6 +10,7 @@ let csrfToken = null;
 let projectsLoading = false;
 let historyLoading = false;
 let systemResourcesLoading = false;
+let systemResourcesLoaded = false;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -119,10 +120,25 @@ async function loadSystemResources() {
       api("/api/system/overview"),
       api("/api/system/images"),
     ]);
-    const diskDetail = `已用 ${formatBytes(overview.disk.used_bytes)}，可用 ${formatBytes(overview.disk.available_bytes)}`;
+    const systemDisk = overview.system_disk;
+    const dataDisk = overview.data_disk;
+    const sameDisk = systemDisk.mount_point === dataDisk.mount_point;
+    const systemDiskDetail = `挂载于 ${systemDisk.mount_point} · 已用 ${formatBytes(systemDisk.used_bytes)}，可用 ${formatBytes(systemDisk.available_bytes)}`;
+    const dataDiskDetail = sameDisk
+      ? `与系统盘相同 · 可用 ${formatBytes(dataDisk.available_bytes)}`
+      : `挂载于 ${dataDisk.mount_point} · 已用 ${formatBytes(dataDisk.used_bytes)}，可用 ${formatBytes(dataDisk.available_bytes)}`;
     const memoryDetail = `可用 ${formatBytes(overview.memory.available_bytes)}`;
     $("#system-metrics").innerHTML = [
-      metric("系统盘", `${overview.disk.used_percent.toFixed(0)}%`, diskDetail),
+      metric(
+        "系统盘",
+        `${systemDisk.used_percent.toFixed(0)}%`,
+        systemDiskDetail,
+      ),
+      metric(
+        "数据盘",
+        `${dataDisk.used_percent.toFixed(0)}%`,
+        dataDiskDetail,
+      ),
       metric(
         "内存",
         `${overview.memory.used_percent.toFixed(0)}%`,
@@ -174,6 +190,7 @@ async function loadSystemResources() {
       checkbox.onchange = updateImageCleanupButton;
     });
     updateImageCleanupButton();
+    systemResourcesLoaded = true;
   } catch (error) {
     diagnose("系统空间与镜像", error.message);
     $("#system-metrics").innerHTML =
@@ -186,6 +203,26 @@ async function loadSystemResources() {
   } finally {
     $("#system-resources-refresh").disabled = false;
     systemResourcesLoading = false;
+  }
+}
+
+function selectTopTab(tab, updateLocation = true) {
+  const selectedTab = tab === "system" ? "system" : "deploy";
+  for (const name of ["deploy", "system"]) {
+    const active = name === selectedTab;
+    $(`#panel-${name}`).hidden = !active;
+    const button = $(`#tab-${name}`);
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  }
+  if (updateLocation) {
+    const target = selectedTab === "system"
+      ? `${window.location.pathname}${window.location.search}#system`
+      : `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(null, "", target);
+  }
+  if (selectedTab === "system" && !systemResourcesLoaded) {
+    void loadSystemResources();
   }
 }
 
@@ -749,14 +786,17 @@ $("#update-install").onclick = confirmSystemUpdate;
 $("#system-resources-refresh").onclick = loadSystemResources;
 $("#image-cleanup").onclick = cleanupImages;
 $("#build-cache-cleanup").onclick = cleanupBuildCache;
+document.querySelectorAll(".top-tabs button").forEach((button) => {
+  button.onclick = () => selectTopTab(button.dataset.tab);
+});
 $("#diagnostics-clear").onclick = () => {
   diagnostics = [];
   $("#diagnostics").textContent = "（暂无诊断信息）";
 };
 loadProjects();
-loadSystemResources();
 loadHistory();
 loadSystemUpdate();
+selectTopTab(window.location.hash === "#system" ? "system" : "deploy", false);
 setInterval(() => {
   loadProjects();
   loadHistory();

@@ -106,15 +106,31 @@ fi
 rollback_root="${test_dir}/rollback"
 setup_case "${rollback_root}"
 stage_candidate "${rollback_root}" "1.1.0"
-# The generated mock must evaluate $1 when it runs, not while this test writes it.
+# 第一次 restart 后模拟新版本启动失败，第二次 restart 后模拟旧版本恢复成功。
+# The generated mock must evaluate variables when it runs, not while this test writes it.
 # shellcheck disable=SC2016
-printf '#!/usr/bin/env bash\nif [[ "$1" == "is-active" ]]; then exit 1; fi\nexit 0\n' \
-  > "${rollback_root}/mock-bin/systemctl"
+printf '#!/usr/bin/env bash\ncounter="%s"\nif [[ "$1" == "restart" ]]; then count=0; [[ ! -f "${counter}" ]] || count="$(<"${counter}")"; printf "%%s" "$((count + 1))" > "${counter}"; exit 0; fi\nif [[ "$1" == "is-active" ]]; then [[ -f "${counter}" ]] && (( $(<"${counter}") >= 2 )); exit; fi\nexit 0\n' \
+  "${rollback_root}/restart-count" > "${rollback_root}/mock-bin/systemctl"
 chmod 0755 "${rollback_root}/mock-bin/systemctl"
 if run_helper "${rollback_root}"; then
   fail "failed restart reported success"
 fi
 [[ "$("${rollback_root}/usr/local/bin/windplume-deploy" --version)" == "windplume-deploy 1.0.0" ]] || fail "rollback did not restore old binary"
 grep -Fq '"state":"rolled_back"' "${rollback_root}/var/lib/windplume-deploy/update-status/status.json" || fail "rollback status"
+grep -Fq '已恢复旧版本 1.0.0' "${rollback_root}/var/lib/windplume-deploy/update-status/status.json" || fail "rollback message"
+
+double_failure_root="${test_dir}/double-failure"
+setup_case "${double_failure_root}"
+stage_candidate "${double_failure_root}" "1.1.0"
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nif [[ "$1" == "is-active" ]]; then exit 1; fi\nexit 0\n' \
+  > "${double_failure_root}/mock-bin/systemctl"
+chmod 0755 "${double_failure_root}/mock-bin/systemctl"
+if run_helper "${double_failure_root}"; then
+  fail "double startup failure reported success"
+fi
+[[ "$("${double_failure_root}/usr/local/bin/windplume-deploy" --version)" == "windplume-deploy 1.0.0" ]] || fail "double failure did not restore old binary"
+grep -Fq '"state":"failed"' "${double_failure_root}/var/lib/windplume-deploy/update-status/status.json" || fail "double failure status"
+grep -Fq '新版本和旧版本均未能启动' "${double_failure_root}/var/lib/windplume-deploy/update-status/status.json" || fail "double failure message"
 
 echo "update helper tests passed"

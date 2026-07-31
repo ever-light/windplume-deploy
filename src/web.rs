@@ -1026,7 +1026,16 @@ mod tests {
         .unwrap();
         assert!(index.contains(">刷新版本</button>"));
         assert!(index.contains("系统更新"));
-        assert!(index.contains("系统空间与镜像"));
+        assert!(index.contains("部署管理"));
+        assert!(index.contains("系统资源"));
+        assert!(index.contains("主机与 Docker 资源"));
+        let projects_at = index.find("Compose 项目").unwrap();
+        let versions_at = index.find("versions-section").unwrap();
+        let update_at = index.find("system-update-section").unwrap();
+        let system_resources_at = index.find("panel-system").unwrap();
+        assert!(projects_at < versions_at);
+        assert!(versions_at < update_at);
+        assert!(update_at < system_resources_at);
         assert!(index.contains("受管 Compose 镜像"));
         assert!(index.contains("清除 30 天前记录"));
         assert!(!index.contains("<th>更新时间</th>"));
