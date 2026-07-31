@@ -338,10 +338,11 @@ async fn run(
         Ok(artifact) => {
             if let Err(error) = state.storage.set_phase(&item.id, "committing").await {
                 log.push_str(&format!("\n无法记录提交阶段: {error}\n"));
-                let _ = rollback(&state, &project, &service, &mut log).await;
+                let rollback_result = rollback(&state, &project, &service, &mut log).await;
+                let rollback_status = rollback_outcome(rollback_result, &mut log);
                 let _ = state
                     .storage
-                    .finish_failure(&item.id, &error.to_string(), "succeeded", &log)
+                    .finish_failure(&item.id, &error.to_string(), rollback_status, &log)
                     .await;
                 return;
             }
@@ -361,12 +362,8 @@ async fn run(
                 .await
             {
                 tracing::error!(deployment_id=%item.id,error=%error,"cannot persist success");
-                let rollback_status =
-                    if rollback(&state, &project, &service, &mut log).await.is_ok() {
-                        "succeeded"
-                    } else {
-                        "failed"
-                    };
+                let rollback_result = rollback(&state, &project, &service, &mut log).await;
+                let rollback_status = rollback_outcome(rollback_result, &mut log);
                 let _ = state
                     .storage
                     .finish_failure(
@@ -387,14 +384,7 @@ async fn run(
             append_container_logs(&state, &project, &service, &mut log).await;
             begin_log_step(&mut log, "开始回退");
             let rollback = rollback(&state, &project, &service, &mut log).await;
-            let rollback_status = if rollback.is_ok() {
-                "succeeded"
-            } else {
-                "failed"
-            };
-            if let Err(rollback_error) = rollback {
-                log.push_str(&format!("回退失败: {rollback_error}\n"));
-            }
+            let rollback_status = rollback_outcome(rollback, &mut log);
             if let Err(storage_error) = state
                 .storage
                 .finish_failure(&item.id, &error.to_string(), rollback_status, &log)
@@ -575,12 +565,8 @@ async fn run_revision(
                 .await
             {
                 tracing::error!(operation_id=%item.id,error=%error,"cannot persist rollback");
-                let rollback_status =
-                    if rollback(&state, &project, &service, &mut log).await.is_ok() {
-                        "succeeded"
-                    } else {
-                        "failed"
-                    };
+                let rollback_result = rollback(&state, &project, &service, &mut log).await;
+                let rollback_status = rollback_outcome(rollback_result, &mut log);
                 let _ = state
                     .storage
                     .finish_failure(
@@ -593,11 +579,22 @@ async fn run_revision(
             }
         }
         Err(error) => {
-            let _ = rollback(&state, &project, &service, &mut log).await;
+            let rollback_result = rollback(&state, &project, &service, &mut log).await;
+            let rollback_status = rollback_outcome(rollback_result, &mut log);
             let _ = state
                 .storage
-                .finish_failure(&item.id, &error.to_string(), "succeeded", &log)
+                .finish_failure(&item.id, &error.to_string(), rollback_status, &log)
                 .await;
+        }
+    }
+}
+
+fn rollback_outcome(result: anyhow::Result<()>, log: &mut String) -> &'static str {
+    match result {
+        Ok(()) => "succeeded",
+        Err(error) => {
+            let _ = writeln!(log, "回退失败: {error}");
+            "failed"
         }
     }
 }
@@ -1083,6 +1080,52 @@ mod tests {
             .unwrap();
         assert_eq!(current.desired_version, "1.0.0");
         assert_eq!(current.image_digest, "sha256:one");
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_records_failed_when_current_version_cannot_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, _) = state(
+            &dir,
+            vec![
+                output(false, "rollback target failed"),
+                output(false, "current version restore failed"),
+            ],
+        )
+        .await;
+        persist_success(&state, "first", "1.0.0", "sha256:one", "sha256:image-one").await;
+        persist_success(&state, "second", "2.0.0", "sha256:two", "sha256:image-two").await;
+
+        let operation = enqueue_rollback(state.clone(), "app", "identity")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let current = state
+                .storage
+                .deployment(&operation.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status != "queued" && current.status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let operation = state
+            .storage
+            .deployment(&operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, "failed");
+        assert_eq!(operation.rollback_status.as_deref(), Some("failed"));
+        assert!(
+            operation
+                .command_log
+                .contains("current version restore failed")
+        );
+        assert!(operation.command_log.contains("回退失败"));
     }
 
     #[tokio::test]
