@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly protocol_version="2"
+readonly protocol_version="3"
 readonly service_name="windplume-deploy"
 test_root="${WINDPLUME_UPDATE_TEST_ROOT:-}"
 if [[ -n "${test_root}" && ( "${WINDPLUME_UPDATE_TESTING:-}" != "1" || "${test_root}" != /tmp/* ) ]]; then
@@ -20,7 +20,6 @@ readonly root_dir="${data_dir}/update-root"
 readonly status_dir="${data_dir}/update-status"
 readonly request_file="${request_dir}/request"
 readonly candidate_file="${request_dir}/candidate"
-readonly checksum_file="${request_dir}/candidate.sha256"
 readonly signature_file="${request_dir}/candidate.sig"
 readonly status_file="${status_dir}/status.json"
 readonly public_key="${test_root}/etc/windplume-deploy/release-signing-public.pem"
@@ -42,7 +41,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-for command_name in chmod chown date install mktemp mv openssl rm seq sha256sum sleep stat systemctl; do
+for command_name in chmod chown date install mktemp mv openssl rm seq sleep stat systemctl; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "缺少必要命令：${command_name}" >&2
     exit 1
@@ -69,7 +68,11 @@ write_status() {
 }
 
 cleanup_staged() {
-  rm -f -- "${request_file}" "${candidate_file}" "${checksum_file}" "${signature_file}"
+  rm -f -- \
+    "${request_file}" \
+    "${candidate_file}" \
+    "${request_dir}/candidate.sha256" \
+    "${signature_file}"
 }
 
 # Called indirectly by the ERR trap.
@@ -125,7 +128,7 @@ if [[ ! "${version}" =~ ^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
   fail_staged_update "unknown" "更新请求版本无效"
 fi
 
-for staged_file in "${candidate_file}" "${checksum_file}" "${signature_file}"; do
+for staged_file in "${candidate_file}" "${signature_file}"; do
   if [[ ! -f "${staged_file}" || -L "${staged_file}" ]]; then
     fail_staged_update "${version}" "更新暂存文件不完整或类型不安全"
   fi
@@ -161,13 +164,6 @@ if (( $(stat -c '%s' -- "${work_dir}/candidate") > max_candidate_bytes )); then
   fail_staged_update "${version}" "复制后的候选二进制大小无效"
 fi
 
-checksum="$(<"${checksum_file}")"
-if [[ ! "${checksum}" =~ ^[0-9a-f]{64}$ ]]; then
-  fail_staged_update "${version}" "候选二进制校验值无效"
-fi
-if ! printf '%s  %s\n' "${checksum}" "${work_dir}/candidate" | sha256sum --check --status; then
-  fail_staged_update "${version}" "候选二进制 SHA-256 校验失败"
-fi
 if ! openssl dgst -sha256 -verify "${public_key}" \
     -signature "${work_dir}/candidate.sig" "${work_dir}/candidate" >/dev/null 2>&1; then
   fail_staged_update "${version}" "候选二进制 Release 签名无效"

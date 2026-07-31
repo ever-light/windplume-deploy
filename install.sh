@@ -45,7 +45,7 @@ for source_file in \
   fi
 done
 
-for command_name in chgrp chmod docker find getent groupadd id install openssl sed sha256sum systemctl useradd usermod; do
+for command_name in chgrp chmod docker find getent groupadd id install openssl sed systemctl useradd usermod; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "缺少必要命令：${command_name}" >&2
     exit 1

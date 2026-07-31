@@ -26,7 +26,7 @@ const INSTALLED_UPDATE_HELPER: &str = "/usr/local/libexec/windplume-deploy-updat
 const INSTALLED_UPDATE_PATH_UNIT: &str = "/etc/systemd/system/windplume-deploy-update.path";
 const INSTALLED_UPDATE_PUBLIC_KEY: &str = "/etc/windplume-deploy/release-signing-public.pem";
 const INSTALLED_UPDATE_STATUS: &str = "/var/lib/windplume-deploy/update-status/status.json";
-const UPDATE_PROTOCOL_VERSION: &str = "2";
+const UPDATE_PROTOCOL_VERSION: &str = "3";
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -232,8 +232,8 @@ impl UpdateManager {
         )?;
         let expected_name = format!("windplume-deploy-{}-linux-x86_64.tar.gz", release.version);
         let expected_sha = parse_checksum(&checksum, &expected_name)?;
-        let actual_sha = format!("{:x}", Sha256::digest(&archive));
-        if actual_sha != expected_sha {
+        let archive_sha = format!("{:x}", Sha256::digest(&archive));
+        if archive_sha != expected_sha {
             return Err(AppError::Update("Release SHA-256 校验失败".into()));
         }
 
@@ -250,14 +250,7 @@ impl UpdateManager {
             "校验完成，等待 systemd 更新助手",
         )
         .await?;
-        stage_update(
-            &update_dir,
-            &candidate,
-            actual_sha.as_bytes(),
-            &signature,
-            &release.version,
-        )
-        .await?;
+        stage_update(&update_dir, &candidate, &signature, &release.version).await?;
         Ok(())
     }
 
@@ -461,12 +454,16 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 async fn stage_update(
     update_dir: &Path,
     candidate: &[u8],
-    checksum: &[u8],
     signature: &[u8],
     version: &str,
 ) -> std::io::Result<()> {
     fs::create_dir_all(update_dir).await?;
     match fs::remove_file(update_dir.join("request")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::remove_file(update_dir.join("candidate.sha256")).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -478,7 +475,6 @@ async fn stage_update(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&candidate_path, std::fs::Permissions::from_mode(0o755)).await?;
     }
-    write_atomic(&update_dir.join("candidate.sha256"), checksum).await?;
     write_atomic(&update_dir.join("candidate.sig"), signature).await?;
     write_atomic(&update_dir.join("request"), version.as_bytes()).await
 }
@@ -596,21 +592,19 @@ mod tests {
         tokio::fs::write(update_dir.join("request"), "stale")
             .await
             .unwrap();
-        stage_update(
-            &update_dir,
-            b"candidate",
-            b"checksum",
-            b"signature",
-            "1.2.3",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(update_dir.join("candidate.sha256"), "legacy")
+            .await
+            .unwrap();
+        stage_update(&update_dir, b"candidate", b"signature", "1.2.3")
+            .await
+            .unwrap();
         assert_eq!(
             tokio::fs::read(update_dir.join("candidate.sig"))
                 .await
                 .unwrap(),
             b"signature"
         );
+        assert!(!update_dir.join("candidate.sha256").exists());
         assert_eq!(
             tokio::fs::read_to_string(update_dir.join("request"))
                 .await
@@ -625,10 +619,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("helper");
-        std::fs::write(&helper, "#!/bin/sh\necho 1\n").unwrap();
+        std::fs::write(&helper, "#!/bin/sh\necho 2\n").unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!helper_protocol_matches(&helper));
-        std::fs::write(&helper, "#!/bin/sh\necho 2\n").unwrap();
+        std::fs::write(&helper, "#!/bin/sh\necho 3\n").unwrap();
         assert!(helper_protocol_matches(&helper));
     }
 }

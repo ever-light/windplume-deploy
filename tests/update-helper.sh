@@ -45,7 +45,6 @@ stage_candidate() {
   local version="$2"
   local update_dir="${root}/var/lib/windplume-deploy/update"
   make_binary "${update_dir}/candidate" "${version}"
-  sha256sum "${update_dir}/candidate" | awk '{print $1}' > "${update_dir}/candidate.sha256"
   openssl dgst -sha256 -sign "${root}/private.pem" \
     -out "${update_dir}/candidate.sig" "${update_dir}/candidate"
   printf '%s' "${version}" > "${update_dir}/request"
@@ -60,7 +59,7 @@ run_helper() {
     "${helper}"
 }
 
-[[ "$("${helper}" --protocol-version)" == "2" ]] || fail "protocol version"
+[[ "$("${helper}" --protocol-version)" == "3" ]] || fail "protocol version"
 
 success_root="${test_dir}/success"
 setup_case "${success_root}"
@@ -89,8 +88,6 @@ version_root="${test_dir}/version-mismatch"
 setup_case "${version_root}"
 stage_candidate "${version_root}" "1.1.0"
 make_binary "${version_root}/var/lib/windplume-deploy/update/candidate" "1.1.1"
-sha256sum "${version_root}/var/lib/windplume-deploy/update/candidate" | awk '{print $1}' \
-  > "${version_root}/var/lib/windplume-deploy/update/candidate.sha256"
 openssl dgst -sha256 -sign "${version_root}/private.pem" \
   -out "${version_root}/var/lib/windplume-deploy/update/candidate.sig" \
   "${version_root}/var/lib/windplume-deploy/update/candidate"
