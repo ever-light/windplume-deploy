@@ -43,6 +43,11 @@ jobs:
       - name: Run tests
         run: cargo +1.96 test --locked --all-features
 
+      - name: Run real Docker Compose integration
+        env:
+          WINDPLUME_DOCKER_INTEGRATION: "1"
+        run: cargo +1.96 test --locked --all-features compose::tests::real_docker_deploys_pinned_digest_and_reads_runtime_when_enabled -- --exact --nocapture
+
       - name: Validate shell scripts
         run: |
           bash -n install.sh deploy/windplume-deploy-update tests/update-helper.sh

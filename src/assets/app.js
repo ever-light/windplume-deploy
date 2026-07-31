@@ -6,6 +6,9 @@ let latestSystemRelease = null;
 let systemUpdatePolling = false;
 let diagnostics = [];
 let containerLogsRequest = 0;
+let csrfToken = null;
+let projectsLoading = false;
+let historyLoading = false;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -17,7 +20,20 @@ const esc = (value) =>
   );
 
 async function api(url, options) {
-  const response = await fetch(url, options);
+  const request = { ...(options || {}) };
+  const method = String(request.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    if (!csrfToken) {
+      const response = await fetch("/api/session", { cache: "no-store" });
+      if (!response.ok) throw new Error("无法建立安全会话");
+      csrfToken = (await response.json()).csrf_token;
+    }
+    request.headers = {
+      ...(request.headers || {}),
+      "X-Windplume-CSRF": csrfToken,
+    };
+  }
+  const response = await fetch(url, request);
   let data;
   try {
     data = await response.json();
@@ -54,25 +70,35 @@ function badge(status) {
 }
 
 function serviceCard(project, service) {
-  const consistency = !service.desired_image
-    ? '<span class="muted">未建立部署基线</span>'
-    : `<span class="${service.drift ? "drift" : ""}">${service.drift ? "存在 drift" : "一致"}</span>`;
+  const imageStatus = service.image_status;
+  const deploymentVersion =
+    imageStatus === "unmanaged"
+      ? '<span class="muted">未纳管</span>'
+      : `<strong>${esc(service.desired_version)}</strong>`;
+  const driftDetails =
+    imageStatus === "drift"
+      ? `<span>镜像状态</span><span class="drift">运行镜像偏离部署基线</span>
+         <span>基线镜像</span><code>${esc(service.desired_image)}</code>`
+      : "";
+  const runningImage = service.replicas > 1 && !service.actual_image
+    ? "多个副本镜像不一致"
+    : service.actual_image;
   const busy = project.deployment_in_progress;
   const missing = ["down", "unknown"].includes(service.container_status);
   const stopped = ["exited", "dead"].includes(service.container_status);
   return `<article class="card" data-project="${esc(project.id)}" data-service="${esc(service.id)}">
     <div class="card-head">
-      <div><h3>${esc(service.id)}</h3><span class="muted">${esc(service.version_source)}</span></div>
+      <div><h3>${esc(service.id)}</h3><span class="muted">${esc(service.version_source)}${service.replicas > 1 ? ` · ${esc(service.replicas)} 副本` : ""}</span></div>
       ${badge(service.container_status)}
     </div>
     <div class="kv">
-      <span>期望版本</span><strong>${esc(service.desired_version)}</strong>
-      <span>期望镜像</span><code>${esc(service.desired_image)}</code>
-      <span>实际镜像</span><code>${esc(service.actual_image)}</code>
-      <span>一致性</span>${consistency}
+      <span>部署版本</span>${deploymentVersion}
+      <span>运行镜像</span><code>${esc(runningImage)}</code>
+      ${driftDetails}
     </div>
     <div class="actions service-actions" style="justify-content:flex-end;flex-wrap:wrap;margin-top:14px">
       <button class="service-logs" data-project="${esc(project.id)}" data-service="${esc(service.id)}" ${missing ? "disabled" : ""}>查看日志</button>
+      <button class="rollback" data-project="${esc(project.id)}" data-service="${esc(service.id)}" ${busy || !service.rollback_available ? "disabled" : ""}>回滚上一版本</button>
       <button class="lifecycle" data-action="recreate" data-project="${esc(project.id)}" data-service="${esc(service.id)}" ${busy ? "disabled" : ""}>重建当前版本</button>
       <button class="lifecycle" data-action="stop" data-project="${esc(project.id)}" data-service="${esc(service.id)}" ${busy || missing || stopped ? "disabled" : ""}>停止</button>
       <button class="lifecycle danger" data-action="down" data-project="${esc(project.id)}" data-service="${esc(service.id)}" ${busy || missing ? "disabled" : ""}>下线</button>
@@ -81,6 +107,8 @@ function serviceCard(project, service) {
 }
 
 async function loadProjects() {
+  if (projectsLoading) return;
+  projectsLoading = true;
   try {
     projects = await api("/api/projects");
     const busyCount = projects.filter((project) => project.deployment_in_progress).length;
@@ -120,9 +148,17 @@ async function loadProjects() {
         );
       };
     });
+    document.querySelectorAll(".rollback").forEach((button) => {
+      button.onclick = (event) => {
+        event.stopPropagation();
+        confirmRollback(button.dataset.project, button.dataset.service);
+      };
+    });
   } catch (error) {
     diagnose("项目状态", error.message);
     $("#projects").innerHTML = `<p class="drift">${esc(error.message)}</p>`;
+  } finally {
+    projectsLoading = false;
   }
 }
 
@@ -199,11 +235,39 @@ function operationLabel(operation) {
   return (
     {
       deploy: "部署版本",
+      rollback: "回滚版本",
       recreate: "重建当前版本",
       stop: "停止",
       down: "下线",
     }[operation] || operation
   );
+}
+
+function confirmRollback(projectId, serviceId) {
+  const project = projects.find((item) => item.id === projectId);
+  const service = project?.services.find((item) => item.id === serviceId);
+  if (!service) return;
+  $("#confirm-text").textContent =
+    `项目：${projectId}\n服务：${serviceId}\n当前版本：${service.desired_version || "未部署"}\n\n将恢复上一个成功部署版本；新部署记录会使用不可变镜像。`;
+  $("#confirm-go").onclick = async (event) => {
+    event.preventDefault();
+    $("#confirm-go").disabled = true;
+    try {
+      const operation = await api(
+        `/api/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(serviceId)}/rollback`,
+        { method: "POST" },
+      );
+      $("#confirm").close();
+      toast(`回滚操作 ${operation.operation_id} 已创建`);
+      await poll(operation.operation_id);
+    } catch (error) {
+      diagnose(`${projectId} / ${serviceId} 回滚`, error.message);
+      toast(error.message);
+    } finally {
+      $("#confirm-go").disabled = false;
+    }
+  };
+  $("#confirm").showModal();
 }
 
 function confirmLifecycle(projectId, serviceId, action) {
@@ -276,6 +340,8 @@ function elapsed(deployment) {
 }
 
 async function loadHistory() {
+  if (historyLoading) return;
+  historyLoading = true;
   try {
     const rows = await api("/api/deployments?limit=50");
     $("#history").innerHTML =
@@ -297,6 +363,8 @@ async function loadHistory() {
   } catch (error) {
     diagnose("操作历史", error.message);
     toast(error.message);
+  } finally {
+    historyLoading = false;
   }
 }
 
@@ -425,7 +493,7 @@ async function loadSystemUpdate(refresh = false) {
       !data.self_update_supported || !data.update_available || active;
     if (!data.self_update_supported) {
       $("#update-status").textContent =
-        "自更新不可用（需 Linux x86_64，并需运行新版 install.sh 安装签名公钥和 v3 更新助手）";
+        "自更新不可用（需 Linux x86_64，并需运行 install.sh 安装签名公钥和更新助手）";
     }
     if (active && !systemUpdatePolling) pollSystemUpdate();
   } catch (error) {

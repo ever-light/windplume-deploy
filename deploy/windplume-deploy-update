@@ -71,7 +71,6 @@ cleanup_staged() {
   rm -f -- \
     "${request_file}" \
     "${candidate_file}" \
-    "${request_dir}/candidate.sha256" \
     "${signature_file}"
 }
 

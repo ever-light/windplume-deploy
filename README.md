@@ -6,7 +6,8 @@ Compose 文件路径，程序会调用 `docker compose config` 自动识别项�
 版本、显式拉取、健康检查和失败回退。
 
 服务不包含应用登录、权限、Webhook、无人值守自动部署或 Docker 凭据管理，默认
-只监听 `127.0.0.1:8180`。
+只监听 `127.0.0.1:8180`。所有页面写操作使用运行时 CSRF Token，并校验浏览器
+`Origin` 与请求 `Host`；这用于阻止跨站请求，不等同于用户认证。
 
 ## 配置
 
@@ -88,13 +89,18 @@ services:
 
 选择一个服务和 tag 后，程序会：
 
-1. 在数据目录生成只覆盖镜像 tag 的 `compose.deploy.yaml`；
+1. 在数据目录生成只覆盖目标服务镜像的 `compose.deploy.yaml`；
 2. 执行 `docker compose pull <service>`；
-3. 执行 `docker compose up -d <service>`；
-4. 等待容器进入 `healthy`，没有 healthcheck 时等待 `running`；
-5. 失败时恢复旧 override，并使用本地旧镜像回退。
+3. 读取已拉取镜像的 RepoDigest 和本地 Image ID，并将 override 固定为
+   `repository@sha256:...`；
+4. 执行 `docker compose up -d --no-deps <service>`；
+5. 等待全部副本进入 `healthy`，没有 healthcheck 时等待 `running`，同时确认
+   所有副本运行同一个已验证 Image ID；
+6. 失败时恢复旧 override，并使用上一个已提交镜像回退。
 
 程序不会改写原始 Compose、`.env`、`env_file` 或业务目录。
+tag 只作为用户可读版本和拉取入口；成功部署、运行一致性检查和新版回滚均以
+不可变 digest/Image ID 为准。
 
 每个服务还提供以下生命周期操作：
 
@@ -104,10 +110,30 @@ services:
 - “停止”保留容器；后续行为仍受服务的 Docker restart policy 影响。
 - “下线”停止并删除目标服务容器，不删除镜像、命名卷、绑定目录或
   项目共享网络。可通过“重建当前版本”再次上线。
+- “回滚上一版本”恢复该服务上一个成功部署的不可变镜像制品。
 
-部署、重建、停止和下线都记录在“操作历史”中，可手动清除 30 天前已完成的
+部署、回滚、重建、停止和下线都记录在“操作历史”中，可手动清除 30 天前已完成的
 记录。同一 Compose 项目的操作互斥执行。重建后若新配置不健康，程序会记录
 失败，但无法自动恢复被用户原地修改的旧 Compose 配置。
+
+部署任务会持久化 `pulling`、`starting`、`checking` 和 `committing` 阶段。
+如果管理程序在部署期间重启，启动时会检查实际容器：已验证候选镜像仍健康时
+补记成功，否则主动恢复上一个已提交版本；无法恢复时会在操作历史中明确标记，
+不会把中断任务静默当成成功。
+
+## 0.2 状态兼容性
+
+0.2 使用全新的 digest 制品模型，不兼容 0.1 的 SQLite 状态库，也不会尝试把
+旧 tag 基线转换成可信 digest。0.1 到 0.2 这一次不能使用页面自更新：应先停止
+管理服务，备份或删除数据目录下的 `deploy.db`、`deploy.db-wal` 和
+`deploy.db-shm`，人工安装 0.2 二进制或 Release 包，再启动服务。后续 0.2.x
+版本可以继续使用页面自更新。
+
+重置管理状态不会删除或重启原有业务容器，但它们会显示为“未纳管”；第一次
+通过 0.2 成功部署后建立新基线。
+
+程序会拒绝直接打开带有旧 migration checksum 的数据库，以免静默生成不可靠的
+回滚记录。操作历史无需保留时可以直接重建；需要留档时应先复制旧数据库。
 
 每个服务卡片提供“查看日志”按钮，按需执行
 `docker compose logs --no-color --tail <行数> <service>`。首次显示最近 50 行，
@@ -150,8 +176,7 @@ systemd 服务，但不会在配置完成前启动服务。安装脚本还会启
 已安装环境的更新控制文件固定位于 `/var/lib/windplume-deploy/update`，
 不受业务状态的 `storage.data_dir` 自定义值影响。
 
-首次启用自更新，或从旧版更新助手迁移到签名协议 v3，必须人工执行一次包含
-更新助手和 Release 公钥的新版 `install.sh`。
+首次启用自更新必须人工执行一次包含更新助手和 Release 公钥的新版 `install.sh`。
 后续常规版本可从页面更新。自更新只替换主二进制；若 Release 说明要求更新
 systemd 或 helper 协议，需再次人工执行安装脚本。
 
@@ -187,7 +212,8 @@ sudo -H -u windplume-deploy docker login ghcr.io -u YOUR_GITHUB_USERNAME
 此服务使用不配置 credential helper 的独立 Docker 配置。
 
 该服务用户能访问 Docker socket，主机权限实际上接近 root，只应把网页开放在
-可信内网。若监听 `0.0.0.0`，应同时配置防火墙或带认证的反向代理。
+可信内网。CSRF/Origin 校验不能识别操作者身份。若监听 `0.0.0.0`，应同时配置
+防火墙或带认证的反向代理，并让代理保留原始 `Host`。
 
 ## 运行和验证
 

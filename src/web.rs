@@ -1,20 +1,25 @@
 use crate::{deployment, error::AppError, state::AppState};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
+    body::Body,
     extract::{Path, Query, State, rejection::JsonRejection},
-    http::{StatusCode, header},
+    http::{Method, Request, StatusCode, header},
+    middleware::{Next, from_fn_with_state},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const CONTAINER_LOG_DEFAULT_TAIL: u32 = 50;
 const CONTAINER_LOG_MAX_TAIL: u32 = 200;
 const HISTORY_RETENTION_DAYS: i64 = 30;
 
 pub fn router(state: AppState) -> Router {
+    let csrf = CsrfToken(Arc::from(uuid::Uuid::new_v4().simple().to_string()));
     Router::new()
         .route("/health", get(health))
+        .route("/api/session", get(session))
         .route("/api/projects", get(projects))
         .route(
             "/api/projects/{project_id}/services/{service_id}/versions",
@@ -23,6 +28,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/projects/{project_id}/services/{service_id}/deploy",
             post(deploy),
+        )
+        .route(
+            "/api/projects/{project_id}/services/{service_id}/rollback",
+            post(rollback_service),
         )
         .route(
             "/api/projects/{project_id}/services/{service_id}/lifecycle",
@@ -44,7 +53,67 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/assets/app.js", get(js))
         .route("/assets/app.css", get(css))
+        .layer(from_fn_with_state(csrf.clone(), csrf_guard))
+        .layer(Extension(csrf))
         .with_state(state)
+}
+
+#[derive(Clone)]
+struct CsrfToken(Arc<str>);
+
+async fn session(Extension(csrf): Extension<CsrfToken>) -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"csrf_token": csrf.0.as_ref()})),
+    )
+}
+
+async fn csrf_guard(
+    State(csrf): State<CsrfToken>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    let token_matches = request
+        .headers()
+        .get("x-windplume-csrf")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == csrf.0.as_ref());
+    let origin_matches = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|origin| {
+            let origin_authority = origin
+                .parse::<axum::http::Uri>()
+                .ok()
+                .and_then(|uri| uri.authority().map(|value| value.as_str().to_owned()));
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok());
+            origin_authority
+                .as_deref()
+                .zip(host)
+                .is_some_and(|(origin, host)| origin.eq_ignore_ascii_case(host))
+        })
+        .unwrap_or(true);
+    if !token_matches || !origin_matches {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "csrf_rejected",
+                "message": "请求来源校验失败，请刷新页面后重试"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
@@ -69,7 +138,35 @@ struct ServiceView {
     desired_image: Option<String>,
     actual_image: Option<String>,
     container_status: String,
+    image_status: &'static str,
     drift: bool,
+    replicas: usize,
+    rollback_available: bool,
+}
+
+fn image_status(
+    managed: bool,
+    expected_image: Option<&str>,
+    expected_image_id: Option<&str>,
+    actual: &crate::compose::RuntimeState,
+) -> &'static str {
+    if !managed {
+        return "unmanaged";
+    }
+    if actual.mixed_images {
+        return "drift";
+    }
+    if let Some(expected_id) = expected_image_id {
+        return if actual.actual_image_id.as_deref() == Some(expected_id) {
+            "matched"
+        } else {
+            "drift"
+        };
+    }
+    match (expected_image, actual.actual_image.as_deref()) {
+        (Some(expected), Some(running)) if expected == running => "matched",
+        _ => "drift",
+    }
 }
 
 async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>>, AppError> {
@@ -80,31 +177,68 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
             .ok_or_else(|| AppError::Internal("Compose 项目运行时不存在".into()))?;
         let project = runtime.compose.project();
         let busy = state.updates.is_active() || runtime.deploy_lock.available_permits() == 0;
+        let runtime_timeout = std::time::Duration::from_secs(15).min(project.command_timeout());
+        let runtime_states = if project.services.is_empty() {
+            Ok(std::collections::BTreeMap::new())
+        } else {
+            runtime.compose.runtimes(runtime_timeout).await
+        };
+        if let Err(error) = &runtime_states {
+            tracing::warn!(project_id=%project.id,error=%error,"cannot query project containers");
+        }
+        let mut runtime_states = runtime_states.ok();
         let mut services = Vec::new();
         for service in &project.services {
             let desired = state.storage.state(&project.id, &service.id).await?;
-            let actual = runtime
-                .compose
-                .runtime(
-                    &service.id,
-                    std::time::Duration::from_secs(15).min(project.command_timeout()),
-                )
-                .await;
+            let actual = runtime_states
+                .as_mut()
+                .map(|states| {
+                    states
+                        .remove(&service.id)
+                        .unwrap_or(crate::compose::RuntimeState {
+                            actual_image: None,
+                            actual_image_id: None,
+                            replicas: 0,
+                            mixed_images: false,
+                            container_status: "down".into(),
+                        })
+                })
+                .unwrap_or(crate::compose::RuntimeState {
+                    actual_image: None,
+                    actual_image_id: None,
+                    replicas: 0,
+                    mixed_images: false,
+                    container_status: "unknown".into(),
+                });
             let desired_image = desired.as_ref().map(|item| item.image.clone());
-            let drift = match (&desired_image, &actual.actual_image) {
-                (Some(expected), Some(running)) => expected != running,
-                (None, None) => false,
-                _ => true,
+            let expected_image = desired.as_ref().map(|item| item.pinned_image.as_str());
+            let image_status = image_status(
+                desired.is_some(),
+                expected_image,
+                desired.as_ref().map(|item| item.image_id.as_str()),
+                &actual,
+            );
+            let rollback_available = if let Some(desired) = &desired {
+                state
+                    .storage
+                    .previous_revision(&project.id, &service.id, &desired.last_deployment_id)
+                    .await?
+                    .is_some()
+            } else {
+                false
             };
             services.push(ServiceView {
                 id: service.id.clone(),
                 image: service.image.clone(),
                 version_source: service.version_source.kind(),
-                desired_version: desired.map(|item| item.desired_version),
+                desired_version: desired.as_ref().map(|item| item.desired_version.clone()),
                 desired_image,
                 actual_image: actual.actual_image,
                 container_status: actual.container_status,
-                drift,
+                image_status,
+                drift: image_status == "drift",
+                replicas: actual.replicas,
+                rollback_available,
             });
         }
         out.push(ProjectView {
@@ -186,6 +320,20 @@ async fn deploy(
         Json(serde_json::json!({
             "deployment_id": deployment.id,
             "status": deployment.status
+        })),
+    ))
+}
+
+async fn rollback_service(
+    State(state): State<AppState>,
+    Path((project_id, service_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let operation = deployment::enqueue_rollback(state, &project_id, &service_id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "operation_id": operation.id,
+            "status": operation.status
         })),
     ))
 }
@@ -343,8 +491,7 @@ async fn system_update_status(State(state): State<AppState>) -> Json<crate::upda
 async fn start_update(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     if !state.updates.self_update_supported() {
         return Err(AppError::Update(
-            "当前不支持自更新：需 Linux x86_64，并需人工运行新版 install.sh 安装签名公钥和 v3 更新助手"
-                .into(),
+            "当前不支持自更新：需 Linux x86_64，并需运行 install.sh 安装签名公钥和更新助手".into(),
         ));
     }
     let release = state.updates.latest(true).await?;
@@ -487,6 +634,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_status_distinguishes_unmanaged_matched_and_drifted_services() {
+        let runtime = |image: Option<&str>, image_id: Option<&str>, mixed_images| {
+            crate::compose::RuntimeState {
+                actual_image: image.map(str::to_owned),
+                actual_image_id: image_id.map(str::to_owned),
+                replicas: usize::from(image.is_some()),
+                mixed_images,
+                container_status: "running".into(),
+            }
+        };
+        assert_eq!(
+            image_status(false, None, None, &runtime(None, None, false)),
+            "unmanaged"
+        );
+        assert_eq!(
+            image_status(
+                true,
+                Some("repo/app:1.0.0"),
+                None,
+                &runtime(Some("repo/app:1.0.0"), None, false)
+            ),
+            "matched"
+        );
+        assert_eq!(
+            image_status(
+                true,
+                Some("repo/app:1.0.0"),
+                Some("sha256:one"),
+                &runtime(Some("repo/app@sha256:digest"), Some("sha256:one"), false)
+            ),
+            "matched"
+        );
+        assert_eq!(
+            image_status(
+                true,
+                Some("repo/app:1.0.0"),
+                Some("sha256:one"),
+                &runtime(Some("repo/app@sha256:digest"), Some("sha256:two"), false)
+            ),
+            "drift"
+        );
+        assert_eq!(
+            image_status(
+                true,
+                Some("repo/app:1.0.0"),
+                None,
+                &runtime(Some("repo/app:1.0.0"), None, true)
+            ),
+            "drift"
+        );
+    }
+
     async fn app(dir: &tempfile::TempDir) -> Router {
         let compose_file = dir.path().join("compose.yaml");
         tokio::fs::write(&compose_file, "services: {}\n")
@@ -612,6 +812,11 @@ mod tests {
         assert!(js.contains("/lifecycle"));
         assert!(js.contains("/api/system/update"));
         assert!(js.contains("重建当前版本"));
+        assert!(js.contains("<span>部署版本</span>"));
+        assert!(js.contains("<span>运行镜像</span>"));
+        assert!(js.contains("运行镜像偏离部署基线"));
+        assert!(!js.contains("<span>期望版本</span>"));
+        assert!(!js.contains("<span>一致性</span>"));
         assert!(js.contains("currentTail === 50 ? 100 : maxTail"));
         assert!(js.contains("/api/deployments/cleanup"));
 
@@ -652,6 +857,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::post("/api/projects/app/services/missing/deploy")
+                    .header("x-windplume-csrf", csrf_token(&app).await)
                     .header(header::CONTENT_TYPE, "text/plain")
                     .body(Body::from("no"))
                     .unwrap(),
@@ -660,6 +866,31 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
         assert_eq!(rejected.headers()[header::CONTENT_TYPE], "application/json");
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::post("/api/deployments/cleanup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let foreign_origin = app
+            .clone()
+            .oneshot(
+                Request::post("/api/deployments/cleanup")
+                    .header("host", "deploy.internal")
+                    .header("origin", "https://evil.example")
+                    .header("x-windplume-csrf", csrf_token(&app).await)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_origin.status(), StatusCode::FORBIDDEN);
 
         let missing_logs = app
             .oneshot(
@@ -670,6 +901,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_logs.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn csrf_token(app: &Router) -> String {
+        let response = app
+            .clone()
+            .oneshot(Request::get("/api/session").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        body["csrf_token"].as_str().unwrap().to_owned()
     }
 
     #[tokio::test]

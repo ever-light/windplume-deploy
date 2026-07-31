@@ -72,6 +72,8 @@ impl RegistryClient {
     pub fn new(ttl: Duration) -> Result<Self, AppError> {
         let client = Client::builder()
             .user_agent("windplume-deploy/0.1")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| AppError::Internal(e.to_string()))?;
         Ok(Self {

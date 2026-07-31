@@ -19,8 +19,29 @@ pub struct ServiceState {
     pub service_id: String,
     pub desired_version: String,
     pub image: String,
+    pub pinned_image: String,
+    pub image_digest: String,
+    pub image_id: String,
     pub updated_at: String,
-    pub last_deployment_id: Option<String>,
+    pub last_deployment_id: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
+pub struct DeploymentArtifact {
+    pub phase: String,
+    pub target_image: Option<String>,
+    pub target_pinned_image: Option<String>,
+    pub target_digest: Option<String>,
+    pub target_image_id: Option<String>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+pub struct ServiceRevision {
+    pub version: String,
+    pub image: String,
+    pub pinned_image: String,
+    pub image_digest: String,
+    pub image_id: String,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -76,13 +97,7 @@ impl Storage {
             history_limit,
             max_log_bytes,
         };
-        this.interrupt_unfinished().await?;
         Ok(this)
-    }
-    async fn interrupt_unfinished(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE deployments SET status='interrupted', finished_at=? WHERE status IN ('queued','running')")
-            .bind(Utc::now().to_rfc3339()).execute(&self.pool).await?;
-        Ok(())
     }
     pub async fn health(&self) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
@@ -110,10 +125,59 @@ impl Storage {
             .await
     }
     pub async fn create_deployment(&self, d: &Deployment) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO deployments(id,project_id,service_id,operation,previous_version,target_version,status,started_at,command_log) VALUES(?,?,?,?,?,?,?,?,?)")
             .bind(&d.id).bind(&d.project_id).bind(&d.service_id).bind(&d.operation).bind(&d.previous_version).bind(&d.target_version)
-            .bind(&d.status).bind(&d.started_at).bind(&d.command_log).execute(&self.pool).await?;
+            .bind(&d.status).bind(&d.started_at).bind(&d.command_log).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO deployment_artifacts(deployment_id) VALUES(?)")
+            .bind(&d.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         self.prune().await
+    }
+    pub async fn set_phase(&self, id: &str, phase: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE deployment_artifacts SET phase=? WHERE deployment_id=?")
+            .bind(phase)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    pub async fn set_target_artifact(
+        &self,
+        id: &str,
+        image: &str,
+        pinned_image: &str,
+        digest: &str,
+        image_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE deployment_artifacts SET target_image=?,target_pinned_image=?,target_digest=?,target_image_id=? WHERE deployment_id=?")
+            .bind(image).bind(pinned_image).bind(digest).bind(image_id).bind(id)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn artifact(&self, id: &str) -> Result<Option<DeploymentArtifact>, sqlx::Error> {
+        sqlx::query_as("SELECT phase,target_image,target_pinned_image,target_digest,target_image_id FROM deployment_artifacts WHERE deployment_id=?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+    pub async fn active_deployments(
+        &self,
+    ) -> Result<Vec<(Deployment, DeploymentArtifact)>, sqlx::Error> {
+        let deployments: Vec<Deployment> = sqlx::query_as(
+            "SELECT * FROM deployments WHERE status IN ('queued','running') ORDER BY started_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::new();
+        for deployment in deployments {
+            if let Some(artifact) = self.artifact(&deployment.id).await? {
+                out.push((deployment, artifact));
+            }
+        }
+        Ok(out)
     }
     pub async fn mark_running(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE deployments SET status='running' WHERE id=? AND status='queued'")
@@ -122,23 +186,54 @@ impl Storage {
             .await?;
         Ok(())
     }
-    pub async fn finish_success(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_artifact_success(
         &self,
         id: &str,
         project_id: &str,
         service_id: &str,
         version: &str,
         image: &str,
+        pinned_image: &str,
+        image_digest: &str,
+        image_id: &str,
         log: &str,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now().to_rfc3339();
         let log = truncate_utf8(log, self.max_log_bytes);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO service_state(project_id,service_id,desired_version,image,updated_at,last_deployment_id) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,service_id) DO UPDATE SET desired_version=excluded.desired_version,image=excluded.image,updated_at=excluded.updated_at,last_deployment_id=excluded.last_deployment_id")
-            .bind(project_id).bind(service_id).bind(version).bind(image).bind(&now).bind(id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO service_state(project_id,service_id,desired_version,image,updated_at,last_deployment_id,pinned_image,image_digest,image_id) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,service_id) DO UPDATE SET desired_version=excluded.desired_version,image=excluded.image,updated_at=excluded.updated_at,last_deployment_id=excluded.last_deployment_id,pinned_image=excluded.pinned_image,image_digest=excluded.image_digest,image_id=excluded.image_id")
+            .bind(project_id).bind(service_id).bind(version).bind(image).bind(&now).bind(id)
+            .bind(pinned_image).bind(image_digest).bind(image_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE deployments SET status='succeeded',finished_at=?,command_log=?,rollback_status='not_needed' WHERE id=?")
             .bind(&now).bind(log).bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE deployment_artifacts SET phase='committed' WHERE deployment_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO service_revisions(deployment_id,project_id,service_id,version,image,pinned_image,image_digest,image_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(id).bind(project_id).bind(service_id).bind(version).bind(image)
+            .bind(pinned_image).bind(image_digest).bind(image_id).bind(&now)
+            .execute(&mut *tx).await?;
         tx.commit().await
+    }
+    pub async fn previous_revision(
+        &self,
+        project_id: &str,
+        service_id: &str,
+        current_deployment_id: &str,
+    ) -> Result<Option<ServiceRevision>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT version,image,pinned_image,image_digest,image_id
+             FROM service_revisions
+             WHERE project_id=? AND service_id=? AND deployment_id<>?
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(service_id)
+        .bind(current_deployment_id)
+        .fetch_optional(&self.pool)
+        .await
     }
     pub async fn finish_failure(
         &self,
@@ -149,6 +244,18 @@ impl Storage {
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE deployments SET status='failed',finished_at=?,command_log=?,error_message=?,rollback_status=? WHERE id=?")
             .bind(Utc::now().to_rfc3339()).bind(truncate_utf8(log, self.max_log_bytes)).bind(error).bind(rollback).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn finish_interrupted(
+        &self,
+        id: &str,
+        error: &str,
+        rollback: &str,
+        log: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE deployments SET status='interrupted',finished_at=?,command_log=?,error_message=?,rollback_status=? WHERE id=?")
+            .bind(Utc::now().to_rfc3339()).bind(truncate_utf8(log, self.max_log_bytes))
+            .bind(error).bind(rollback).bind(id).execute(&self.pool).await?;
         Ok(())
     }
     pub async fn finish_operation_success(&self, id: &str, log: &str) -> Result<(), sqlx::Error> {
@@ -178,8 +285,16 @@ impl Storage {
         Ok(result.rows_affected())
     }
     async fn prune(&self) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM deployments WHERE id IN (SELECT id FROM deployments ORDER BY started_at DESC LIMIT -1 OFFSET ?)")
-            .bind(self.history_limit).execute(&self.pool).await?;
+        sqlx::query(
+            "DELETE FROM deployments WHERE id IN (
+            SELECT id FROM deployments
+            WHERE status NOT IN ('queued','running')
+            ORDER BY started_at DESC LIMIT -1 OFFSET ?
+        )",
+        )
+        .bind(self.history_limit)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -198,6 +313,41 @@ pub fn truncate_utf8(value: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn record_success(
+        storage: &Storage,
+        id: &str,
+        project: &str,
+        service: &str,
+        version: &str,
+    ) {
+        let image = format!("repo/{service}:{version}");
+        let digest = format!("sha256:{id}");
+        let pinned = format!("repo/{service}@{digest}");
+        let image_id = format!("sha256:image-{id}");
+        let deployment = Deployment {
+            id: id.into(),
+            project_id: project.into(),
+            service_id: service.into(),
+            operation: "deploy".into(),
+            previous_version: None,
+            target_version: version.into(),
+            status: "queued".into(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            command_log: String::new(),
+            error_message: None,
+            rollback_status: None,
+        };
+        storage.create_deployment(&deployment).await.unwrap();
+        storage
+            .finish_artifact_success(
+                id, project, service, version, &image, &pinned, &digest, &image_id, "",
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn truncates_on_boundary() {
         assert_eq!(
@@ -207,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_interrupts_unfinished_and_prunes_history() {
+    async fn startup_preserves_unfinished_for_recovery_and_prunes_history() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path(), 2, 32).await.unwrap();
         for number in 0..3 {
@@ -236,7 +386,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .all(|item| item.status == "interrupted")
+                .all(|item| item.status == "queued")
         );
         reopened.health().await.unwrap();
         assert!(
@@ -250,17 +400,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_database_with_a_different_migration_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum=x'00' WHERE version=1")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        storage.pool.close().await;
+
+        let error = match Storage::open(dir.path(), 10, 1024).await {
+            Ok(_) => panic!("database with an incompatible checksum was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("was previously applied but has been modified")
+        );
+    }
+
+    #[tokio::test]
     async fn same_service_id_is_isolated_between_projects() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
-        storage
-            .finish_success("one", "frontend", "web", "1.0.0", "image:1.0.0", "")
-            .await
-            .unwrap();
-        storage
-            .finish_success("two", "backend", "web", "2.0.0", "image:2.0.0", "")
-            .await
-            .unwrap();
+        record_success(&storage, "one", "frontend", "web", "1.0.0").await;
+        record_success(&storage, "two", "backend", "web", "2.0.0").await;
         assert_eq!(
             storage
                 .state("frontend", "web")
@@ -279,6 +444,50 @@ mod tests {
                 .desired_version,
             "2.0.0"
         );
+    }
+
+    #[tokio::test]
+    async fn preserves_previous_success_as_a_rollback_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
+        record_success(&storage, "baseline", "app", "api", "1.0.0").await;
+        let deployment = Deployment {
+            id: "next".into(),
+            project_id: "app".into(),
+            service_id: "api".into(),
+            operation: "deploy".into(),
+            previous_version: Some("1.0.0".into()),
+            target_version: "2.0.0".into(),
+            status: "queued".into(),
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            command_log: String::new(),
+            error_message: None,
+            rollback_status: None,
+        };
+        storage.create_deployment(&deployment).await.unwrap();
+        storage
+            .finish_artifact_success(
+                "next",
+                "app",
+                "api",
+                "2.0.0",
+                "repo/api:2.0.0",
+                "repo/api@sha256:two",
+                "sha256:two",
+                "sha256:image-two",
+                "",
+            )
+            .await
+            .unwrap();
+
+        let previous = storage
+            .previous_revision("app", "api", "next")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.version, "1.0.0");
+        assert_eq!(previous.image, "repo/api:1.0.0");
     }
 
     #[tokio::test]
@@ -309,24 +518,5 @@ mod tests {
         assert!(storage.deployment("old").await.unwrap().is_none());
         assert!(storage.deployment("active").await.unwrap().is_some());
         assert!(storage.deployment("recent").await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn legacy_history_rows_default_to_deploy_operation() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
-        sqlx::query("INSERT INTO deployments(id,project_id,service_id,previous_version,target_version,status,started_at,command_log) VALUES('legacy','app','api',NULL,'1.0.0','succeeded','2026-01-01T00:00:00Z','ok')")
-            .execute(&storage.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            storage
-                .deployment("legacy")
-                .await
-                .unwrap()
-                .unwrap()
-                .operation,
-            "deploy"
-        );
     }
 }

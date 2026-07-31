@@ -463,11 +463,6 @@ async fn stage_update(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    match fs::remove_file(update_dir.join("candidate.sha256")).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
     let candidate_path = update_dir.join("candidate");
     write_atomic(&candidate_path, candidate).await?;
     #[cfg(unix)]
@@ -592,9 +587,6 @@ mod tests {
         tokio::fs::write(update_dir.join("request"), "stale")
             .await
             .unwrap();
-        tokio::fs::write(update_dir.join("candidate.sha256"), "legacy")
-            .await
-            .unwrap();
         stage_update(&update_dir, b"candidate", b"signature", "1.2.3")
             .await
             .unwrap();
@@ -604,7 +596,6 @@ mod tests {
                 .unwrap(),
             b"signature"
         );
-        assert!(!update_dir.join("candidate.sha256").exists());
         assert_eq!(
             tokio::fs::read_to_string(update_dir.join("request"))
                 .await

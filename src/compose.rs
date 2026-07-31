@@ -2,7 +2,7 @@ use crate::config::{ProjectConfig, ServiceConfig, service_from_image};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock},
@@ -68,25 +68,35 @@ struct Override {
 struct OverrideService {
     image: String,
 }
-pub async fn write_override(
+pub async fn write_image_override(
     path: &Path,
     services: &[ServiceConfig],
-    versions: &BTreeMap<String, String>,
+    images: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    let by_id: BTreeMap<_, _> = services.iter().map(|s| (s.id.as_str(), s)).collect();
+    let managed = services
+        .iter()
+        .map(|service| service.id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut map = BTreeMap::new();
-    for (id, version) in versions {
-        let svc = by_id
-            .get(id.as_str())
-            .ok_or_else(|| anyhow::anyhow!("未知服务状态 {id}"))?;
+    for (id, image) in images {
+        if !managed.contains(id.as_str()) {
+            anyhow::bail!("未知服务状态 {id}");
+        }
         map.insert(
-            svc.id.clone(),
+            id.clone(),
             OverrideService {
-                image: format!("{}:{}", svc.image, version),
+                image: image.clone(),
             },
         );
     }
-    let bytes = serde_yaml::to_string(&Override { services: map })?.into_bytes();
+    write_override_file(path, map).await
+}
+
+async fn write_override_file(
+    path: &Path,
+    services: BTreeMap<String, OverrideService>,
+) -> anyhow::Result<()> {
+    let bytes = serde_yaml::to_string(&Override { services })?.into_bytes();
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("override 路径缺少父目录"))?;
@@ -117,14 +127,33 @@ pub struct Compose {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RuntimeState {
     pub actual_image: Option<String>,
+    pub actual_image_id: Option<String>,
+    pub replicas: usize,
+    pub mixed_images: bool,
     pub container_status: String,
+}
+#[derive(Debug, Clone)]
+pub struct ImageArtifact {
+    pub image: String,
+    pub pinned_image: String,
+    pub digest: String,
+    pub image_id: String,
 }
 #[derive(Deserialize)]
 struct Inspect {
+    #[serde(rename = "Image", default)]
+    image: String,
     #[serde(rename = "Config")]
     config: InspectConfig,
     #[serde(rename = "State")]
     state: InspectState,
+}
+#[derive(Deserialize)]
+struct ImageInspect {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "RepoDigests", default)]
+    repo_digests: Vec<String>,
 }
 #[derive(Deserialize)]
 struct InspectConfig {
@@ -132,6 +161,8 @@ struct InspectConfig {
     image: String,
     #[serde(rename = "Healthcheck")]
     healthcheck: Option<serde_json::Value>,
+    #[serde(rename = "Labels", default)]
+    labels: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 struct InspectState {
@@ -195,12 +226,44 @@ impl Compose {
     }
     pub async fn up(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
         let (mut args, cwd) = self.base_args();
-        args.extend(["up".into(), "-d".into(), service.into()]);
+        args.extend(["up".into(), "-d".into(), "--no-deps".into(), service.into()]);
         let out = self.runner.run("docker", &args, &cwd, limit).await?;
         if !out.success {
             anyhow::bail!("docker compose up 执行失败\n{}", out.log);
         }
         Ok(out.log)
+    }
+    pub async fn image_artifact(
+        &self,
+        image: &str,
+        repository: &str,
+        limit: Duration,
+    ) -> anyhow::Result<ImageArtifact> {
+        let args = vec!["image".into(), "inspect".into(), image.into()];
+        let cwd = self.project().project_dir().to_path_buf();
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
+        if !out.success {
+            anyhow::bail!("无法检查已拉取镜像\n{}", out.log);
+        }
+        let mut values: Vec<ImageInspect> = serde_json::from_str(&out.log)?;
+        let value = values
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("docker image inspect 未返回镜像"))?;
+        let digest = value
+            .repo_digests
+            .iter()
+            .filter_map(|value| value.rsplit_once('@'))
+            .find(|(repo, _)| repositories_match(repo, repository))
+            .map(|(_, digest)| digest)
+            .filter(|digest| digest.starts_with("sha256:"))
+            .ok_or_else(|| anyhow::anyhow!("已拉取镜像缺少目标仓库的 RepoDigest"))?
+            .to_owned();
+        Ok(ImageArtifact {
+            image: image.into(),
+            pinned_image: format!("{repository}@{digest}"),
+            digest,
+            image_id: value.id,
+        })
     }
     pub async fn recreate(&self, service: &str, limit: Duration) -> anyhow::Result<String> {
         let (mut args, cwd) = self.base_args();
@@ -291,39 +354,128 @@ impl Compose {
         if values.len() != ids.len() {
             anyhow::bail!("部分容器无法检查");
         }
-        let mut ready = true;
-        let mut worst = "healthy".to_owned();
-        let mut image = None;
-        for v in values {
-            image.get_or_insert(v.config.image);
-            if v.config.healthcheck.is_some() {
-                let health = v
-                    .state
-                    .health
-                    .map(|h| h.status)
-                    .unwrap_or_else(|| "starting".into());
-                if health != "healthy" {
-                    ready = false;
-                    worst = health;
-                }
-            } else if v.state.status != "running" {
-                ready = false;
-                worst = v.state.status;
-            } else if worst == "healthy" {
-                worst = "running".into();
+        Ok(summarize(values))
+    }
+    pub async fn runtimes(
+        &self,
+        limit: Duration,
+    ) -> anyhow::Result<BTreeMap<String, RuntimeState>> {
+        let (mut args, cwd) = self.base_args();
+        args.extend(["ps".into(), "-q".into()]);
+        let out = self.runner.run("docker", &args, &cwd, limit).await?;
+        if !out.success {
+            anyhow::bail!("docker compose ps 执行失败");
+        }
+        let ids = out
+            .log
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut inspect_args = vec!["inspect".into()];
+        inspect_args.extend_from_slice(&ids);
+        let out = self
+            .runner
+            .run("docker", &inspect_args, &cwd, limit)
+            .await?;
+        if !out.success {
+            anyhow::bail!("docker inspect 执行失败");
+        }
+        let values: Vec<Inspect> = serde_json::from_str(&out.log)?;
+        let mut grouped: BTreeMap<String, Vec<Inspect>> = BTreeMap::new();
+        for value in values {
+            if let Some(service) = value
+                .config
+                .labels
+                .get("com.docker.compose.service")
+                .cloned()
+            {
+                grouped.entry(service).or_default().push(value);
             }
         }
-        Ok((
-            RuntimeState {
-                actual_image: image,
-                container_status: worst,
-            },
-            ready,
-        ))
+        Ok(grouped
+            .into_iter()
+            .map(|(service, values)| (service, summarize(values).0))
+            .collect())
     }
+}
+
+fn repositories_match(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> String {
+        let value = value
+            .trim_start_matches("docker.io/")
+            .trim_start_matches("index.docker.io/")
+            .trim_start_matches("registry-1.docker.io/");
+        if value.contains('/') {
+            value.to_owned()
+        } else {
+            format!("library/{value}")
+        }
+    }
+    left == right || normalized(left) == normalized(right)
+}
+
+fn summarize(values: Vec<Inspect>) -> (RuntimeState, bool) {
+    let mut ready = true;
+    let mut worst = "healthy".to_owned();
+    let mut images = BTreeSet::new();
+    let mut image_ids = BTreeSet::new();
+    let replicas = values.len();
+    for v in values {
+        images.insert(v.config.image);
+        if !v.image.is_empty() {
+            image_ids.insert(v.image);
+        }
+        if v.config.healthcheck.is_some() {
+            let health = v
+                .state
+                .health
+                .map(|h| h.status)
+                .unwrap_or_else(|| "starting".into());
+            if health != "healthy" {
+                ready = false;
+                worst = health;
+            }
+        } else if v.state.status != "running" {
+            ready = false;
+            worst = v.state.status;
+        } else if worst == "healthy" {
+            worst = "running".into();
+        }
+    }
+    let mixed_images = images.len() > 1 || image_ids.len() > 1;
+    let actual_image = (images.len() == 1).then(|| images.into_iter().next().unwrap());
+    let actual_image_id = (image_ids.len() == 1).then(|| image_ids.into_iter().next().unwrap());
+    (
+        RuntimeState {
+            actual_image,
+            actual_image_id,
+            replicas,
+            mixed_images,
+            container_status: worst,
+        },
+        ready,
+    )
+}
+
+impl Compose {
     pub async fn wait_healthy(
         &self,
         service: &str,
+        health_limit: Duration,
+        command_limit: Duration,
+    ) -> anyhow::Result<String> {
+        self.wait_healthy_image(service, None, health_limit, command_limit)
+            .await
+    }
+    pub async fn wait_healthy_image(
+        &self,
+        service: &str,
+        expected_image_id: Option<&str>,
         health_limit: Duration,
         command_limit: Duration,
     ) -> anyhow::Result<String> {
@@ -332,6 +484,14 @@ impl Compose {
             let (ids, _) = self.ids(service, command_limit).await?;
             match self.inspect(&ids, command_limit).await {
                 Ok((state, true)) => {
+                    if state.mixed_images {
+                        anyhow::bail!("服务的多个副本运行了不同镜像");
+                    }
+                    if let Some(expected) = expected_image_id.filter(|value| !value.is_empty())
+                        && state.actual_image_id.as_deref() != Some(expected)
+                    {
+                        anyhow::bail!("容器运行的镜像 ID 与已验证候选镜像不一致");
+                    }
                     return Ok(format!("容器状态：{}\n", state.container_status));
                 }
                 Ok((state, false)) => {
@@ -358,12 +518,18 @@ impl Compose {
         let Ok((ids, _)) = self.ids(service, limit).await else {
             return RuntimeState {
                 actual_image: None,
+                actual_image_id: None,
+                replicas: 0,
+                mixed_images: false,
                 container_status: "unknown".into(),
             };
         };
         if ids.is_empty() {
             return RuntimeState {
                 actual_image: None,
+                actual_image_id: None,
+                replicas: 0,
+                mixed_images: false,
                 container_status: "down".into(),
             };
         }
@@ -372,6 +538,9 @@ impl Compose {
             .map(|(state, _)| state)
             .unwrap_or(RuntimeState {
                 actual_image: None,
+                actual_image_id: None,
+                replicas: 0,
+                mixed_images: false,
                 container_status: "unknown".into(),
             })
     }
@@ -485,11 +654,11 @@ mod tests {
                 repository: "o/i".into(),
             },
         };
-        let mut v = BTreeMap::new();
-        v.insert("a".into(), "1.2.3".into());
-        write_override(&p, &[s], &v).await.unwrap();
+        let mut images = BTreeMap::new();
+        images.insert("a".into(), "ghcr.io/o/i@sha256:digest".into());
+        write_image_override(&p, &[s], &images).await.unwrap();
         let text = fs::read_to_string(p).await.unwrap();
-        assert!(text.contains("ghcr.io/o/i:1.2.3"));
+        assert!(text.contains("ghcr.io/o/i@sha256:digest"));
     }
 
     #[tokio::test]
@@ -555,6 +724,44 @@ mod tests {
                 .container_status,
             "down"
         );
+    }
+
+    #[tokio::test]
+    async fn batches_project_runtime_and_detects_mixed_replicas() {
+        let dir = tempdir().unwrap();
+        let compose_file = dir.path().join("compose.yaml");
+        fs::write(&compose_file, "services: {}\n").await.unwrap();
+        let runner = Arc::new(FakeRunner(Mutex::new(vec![
+            CommandOutput {
+                success: true,
+                log: "one\ntwo\n".into(),
+            },
+            CommandOutput {
+                success: true,
+                log: r#"[
+                    {"Image":"sha256:one","Config":{"Image":"repo/app@sha256:one","Healthcheck":null,"Labels":{"com.docker.compose.service":"api"}},"State":{"Status":"running","Health":null}},
+                    {"Image":"sha256:two","Config":{"Image":"repo/app@sha256:two","Healthcheck":null,"Labels":{"com.docker.compose.service":"api"}},"State":{"Status":"running","Health":null}}
+                ]"#
+                .into(),
+            },
+        ])));
+        let compose = Compose::new(
+            ProjectConfig {
+                compose_files: vec![compose_file],
+                health_timeout_seconds: 1,
+                command_timeout_seconds: 1,
+                id: "test".into(),
+                services: Vec::new(),
+            },
+            dir.path().join("override.yaml"),
+            runner,
+        );
+        let states = compose.runtimes(Duration::from_secs(1)).await.unwrap();
+        let api = &states["api"];
+        assert_eq!(api.replicas, 2);
+        assert!(api.mixed_images);
+        assert!(api.actual_image.is_none());
+        assert!(api.actual_image_id.is_none());
     }
 
     #[tokio::test]
@@ -693,5 +900,72 @@ mod tests {
             value["services"]["api"]["volumes"][0]["source"],
             dir.path().join("data").display().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn real_docker_deploys_pinned_digest_and_reads_runtime_when_enabled() {
+        if std::env::var_os("WINDPLUME_DOCKER_INTEGRATION").is_none() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let compose_file = dir.path().join("compose.yaml");
+        fs::write(
+            &compose_file,
+            "services:\n  app:\n    image: alpine:3.20\n    command: [\"sh\", \"-c\", \"sleep 60\"]\n",
+        )
+        .await
+        .unwrap();
+        let service = service_from_image("app".into(), "alpine:3.20".into()).unwrap();
+        let project = ProjectConfig {
+            compose_files: vec![compose_file],
+            health_timeout_seconds: 20,
+            command_timeout_seconds: 120,
+            id: format!("windplumeit{}", std::process::id()),
+            services: vec![service.clone()],
+        };
+        let override_file = dir.path().join("compose.deploy.yaml");
+        let runner = Arc::new(ProcessRunner);
+        let compose = Compose::new(project.clone(), override_file.clone(), runner.clone());
+        let result = async {
+            write_image_override(
+                &override_file,
+                &project.services,
+                &BTreeMap::from([("app".into(), "alpine:3.20".into())]),
+            )
+            .await?;
+            compose.pull("app", Duration::from_secs(120)).await?;
+            let artifact = compose
+                .image_artifact("alpine:3.20", "alpine", Duration::from_secs(30))
+                .await?;
+            write_image_override(
+                &override_file,
+                &project.services,
+                &BTreeMap::from([("app".into(), artifact.pinned_image.clone())]),
+            )
+            .await?;
+            compose.up("app", Duration::from_secs(60)).await?;
+            compose
+                .wait_healthy_image(
+                    "app",
+                    Some(&artifact.image_id),
+                    Duration::from_secs(20),
+                    Duration::from_secs(20),
+                )
+                .await?;
+            let states = compose.runtimes(Duration::from_secs(20)).await?;
+            let state = states
+                .get("app")
+                .ok_or_else(|| anyhow::anyhow!("integration container missing"))?;
+            anyhow::ensure!(state.actual_image_id.as_deref() == Some(artifact.image_id.as_str()));
+            anyhow::ensure!(!state.mixed_images);
+            anyhow::Ok(())
+        }
+        .await;
+        let (mut args, cwd) = compose.base_args();
+        args.extend(["down".into(), "--remove-orphans".into()]);
+        let _ = runner
+            .run("docker", &args, &cwd, Duration::from_secs(60))
+            .await;
+        result.unwrap();
     }
 }

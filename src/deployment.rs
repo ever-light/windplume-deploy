@@ -1,9 +1,9 @@
 use crate::{
-    compose::write_override,
+    compose::{ImageArtifact, write_image_override},
     config::{ProjectConfig, ServiceConfig},
     error::AppError,
     state::AppState,
-    storage::Deployment,
+    storage::{Deployment, ServiceRevision},
 };
 use chrono::Utc;
 use std::{
@@ -84,7 +84,7 @@ pub async fn enqueue(
         project_id: project_id.into(),
         service_id: service_id.into(),
         operation: "deploy".into(),
-        previous_version: old.map(|state| state.desired_version),
+        previous_version: old.as_ref().map(|state| state.desired_version.clone()),
         target_version: version.into(),
         status: "queued".into(),
         started_at: Utc::now().to_rfc3339(),
@@ -97,6 +97,62 @@ pub async fn enqueue(
     let task_item = item.clone();
     tokio::spawn(async move {
         run(state, project, service, task_item, permit).await;
+    });
+    Ok(item)
+}
+
+pub async fn enqueue_rollback(
+    state: AppState,
+    project_id: &str,
+    service_id: &str,
+) -> Result<Deployment, AppError> {
+    if state.updates.is_active() {
+        return Err(AppError::Updating);
+    }
+    let runtime = state
+        .project_runtime(project_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let permit = runtime
+        .deploy_lock
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
+    let project = runtime.compose.project();
+    let service = project
+        .services
+        .iter()
+        .find(|service| service.id == service_id)
+        .cloned()
+        .ok_or(AppError::NotFound)?;
+    let current = state
+        .storage
+        .state(project_id, service_id)
+        .await?
+        .ok_or_else(|| AppError::Invalid("当前服务还没有可回滚的部署基线".into()))?;
+    let revision = state
+        .storage
+        .previous_revision(project_id, service_id, &current.last_deployment_id)
+        .await?
+        .ok_or_else(|| AppError::Invalid("没有找到上一个成功部署版本".into()))?;
+    let item = Deployment {
+        id: Uuid::new_v4().to_string(),
+        project_id: project_id.into(),
+        service_id: service_id.into(),
+        operation: "rollback".into(),
+        previous_version: Some(current.desired_version.clone()),
+        target_version: revision.version.clone(),
+        status: "queued".into(),
+        started_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+        command_log: String::new(),
+        error_message: None,
+        rollback_status: None,
+    };
+    state.storage.create_deployment(&item).await?;
+    let task_item = item.clone();
+    tokio::spawn(async move {
+        run_revision(state, project, service, revision, task_item, permit).await;
     });
     Ok(item)
 }
@@ -126,11 +182,8 @@ pub async fn enqueue_lifecycle(
         .find(|service| service.id == service_id)
         .cloned()
         .ok_or(AppError::NotFound)?;
-    let version = state
-        .storage
-        .state(project_id, service_id)
-        .await?
-        .map(|item| item.desired_version);
+    let current = state.storage.state(project_id, service_id).await?;
+    let version = current.as_ref().map(|item| item.desired_version.clone());
     let item = Deployment {
         id: Uuid::new_v4().to_string(),
         project_id: project_id.into(),
@@ -241,7 +294,7 @@ async fn execute_lifecycle(
     Ok(())
 }
 
-async fn versions_from_db(
+async fn images_from_db(
     state: &AppState,
     project: &ProjectConfig,
 ) -> anyhow::Result<BTreeMap<String, String>> {
@@ -256,7 +309,7 @@ async fn versions_from_db(
         .await?
         .into_iter()
         .filter(|state| managed.contains(state.service_id.as_str()))
-        .map(|state| (state.service_id, state.desired_version))
+        .map(|state| (state.service_id, state.pinned_image))
         .collect())
 }
 
@@ -272,23 +325,57 @@ async fn run(
         return;
     }
     let mut log = String::new();
-    let result = deploy_candidate(&state, &project, &service, &item.target_version, &mut log).await;
+    let result = deploy_candidate(
+        &state,
+        &project,
+        &service,
+        &item,
+        &item.target_version,
+        &mut log,
+    )
+    .await;
     match result {
-        Ok(()) => {
-            let image = format!("{}:{}", service.image, item.target_version);
+        Ok(artifact) => {
+            if let Err(error) = state.storage.set_phase(&item.id, "committing").await {
+                log.push_str(&format!("\n无法记录提交阶段: {error}\n"));
+                let _ = rollback(&state, &project, &service, &mut log).await;
+                let _ = state
+                    .storage
+                    .finish_failure(&item.id, &error.to_string(), "succeeded", &log)
+                    .await;
+                return;
+            }
             if let Err(error) = state
                 .storage
-                .finish_success(
+                .finish_artifact_success(
                     &item.id,
                     &project.id,
                     &service.id,
                     &item.target_version,
-                    &image,
+                    &artifact.image,
+                    &artifact.pinned_image,
+                    &artifact.digest,
+                    &artifact.image_id,
                     &log,
                 )
                 .await
             {
                 tracing::error!(deployment_id=%item.id,error=%error,"cannot persist success");
+                let rollback_status =
+                    if rollback(&state, &project, &service, &mut log).await.is_ok() {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    };
+                let _ = state
+                    .storage
+                    .finish_failure(
+                        &item.id,
+                        &format!("容器已启动但无法提交部署状态: {error}"),
+                        rollback_status,
+                        &log,
+                    )
+                    .await;
                 return;
             }
             if let Err(error) = rebuild_project_override(&state, &project).await {
@@ -323,15 +410,18 @@ async fn deploy_candidate(
     state: &AppState,
     project: &ProjectConfig,
     service: &ServiceConfig,
+    item: &Deployment,
     version: &str,
     log: &mut String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ImageArtifact> {
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let mut versions = versions_from_db(state, project).await?;
-    versions.insert(service.id.clone(), version.into());
-    write_override(&runtime.override_file, &project.services, &versions).await?;
+    let image = format!("{}:{version}", service.image);
+    let mut images = images_from_db(state, project).await?;
+    images.insert(service.id.clone(), image.clone());
+    write_image_override(&runtime.override_file, &project.services, &images).await?;
+    state.storage.set_phase(&item.id, "pulling").await?;
     begin_log_step(log, "拉取镜像");
     log.push_str(
         &runtime
@@ -339,6 +429,23 @@ async fn deploy_candidate(
             .pull(&service.id, project.command_timeout())
             .await?,
     );
+    let artifact = runtime
+        .compose
+        .image_artifact(&image, &service.image, project.command_timeout())
+        .await?;
+    state
+        .storage
+        .set_target_artifact(
+            &item.id,
+            &artifact.image,
+            &artifact.pinned_image,
+            &artifact.digest,
+            &artifact.image_id,
+        )
+        .await?;
+    images.insert(service.id.clone(), artifact.pinned_image.clone());
+    write_image_override(&runtime.override_file, &project.services, &images).await?;
+    state.storage.set_phase(&item.id, "starting").await?;
     begin_log_step(log, "启动容器");
     log.push_str(
         &runtime
@@ -346,18 +453,20 @@ async fn deploy_candidate(
             .up(&service.id, project.command_timeout())
             .await?,
     );
+    state.storage.set_phase(&item.id, "checking").await?;
     begin_log_step(log, "检查容器状态");
     log.push_str(
         &runtime
             .compose
-            .wait_healthy(
+            .wait_healthy_image(
                 &service.id,
+                Some(&artifact.image_id),
                 project.health_timeout(),
                 project.command_timeout(),
             )
             .await?,
     );
-    Ok(())
+    Ok(artifact)
 }
 
 async fn rollback(
@@ -369,8 +478,8 @@ async fn rollback(
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let versions = versions_from_db(state, project).await?;
-    write_override(&runtime.override_file, &project.services, &versions).await?;
+    let images = images_from_db(state, project).await?;
+    write_image_override(&runtime.override_file, &project.services, &images).await?;
     begin_log_step(log, "恢复上一版本容器");
     log.push_str(
         &runtime
@@ -390,6 +499,107 @@ async fn rollback(
             .await?,
     );
     Ok(())
+}
+
+async fn run_revision(
+    state: AppState,
+    project: ProjectConfig,
+    service: ServiceConfig,
+    revision: ServiceRevision,
+    item: Deployment,
+    _permit: OwnedSemaphorePermit,
+) {
+    if let Err(error) = state.storage.mark_running(&item.id).await {
+        tracing::error!(operation_id=%item.id,error=%error,"cannot mark rollback running");
+        return;
+    }
+    let mut log = String::new();
+    let result = async {
+        let runtime = state
+            .project_runtime(&project.id)
+            .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
+        let target = revision.pinned_image.clone();
+        state.storage.set_phase(&item.id, "starting").await?;
+        state
+            .storage
+            .set_target_artifact(
+                &item.id,
+                &revision.image,
+                &target,
+                &revision.image_digest,
+                &revision.image_id,
+            )
+            .await?;
+        let mut images = images_from_db(&state, &project).await?;
+        images.insert(service.id.clone(), target);
+        write_image_override(&runtime.override_file, &project.services, &images).await?;
+        begin_log_step(&mut log, "恢复上一个成功版本");
+        log.push_str(
+            &runtime
+                .compose
+                .up(&service.id, project.command_timeout())
+                .await?,
+        );
+        state.storage.set_phase(&item.id, "checking").await?;
+        begin_log_step(&mut log, "检查回滚后的容器状态");
+        log.push_str(
+            &runtime
+                .compose
+                .wait_healthy_image(
+                    &service.id,
+                    Some(&revision.image_id),
+                    project.health_timeout(),
+                    project.command_timeout(),
+                )
+                .await?,
+        );
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            let _ = state.storage.set_phase(&item.id, "committing").await;
+            if let Err(error) = state
+                .storage
+                .finish_artifact_success(
+                    &item.id,
+                    &project.id,
+                    &service.id,
+                    &revision.version,
+                    &revision.image,
+                    &revision.pinned_image,
+                    &revision.image_digest,
+                    &revision.image_id,
+                    &log,
+                )
+                .await
+            {
+                tracing::error!(operation_id=%item.id,error=%error,"cannot persist rollback");
+                let rollback_status =
+                    if rollback(&state, &project, &service, &mut log).await.is_ok() {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    };
+                let _ = state
+                    .storage
+                    .finish_failure(
+                        &item.id,
+                        &format!("容器已回滚但无法提交部署状态: {error}"),
+                        rollback_status,
+                        &log,
+                    )
+                    .await;
+            }
+        }
+        Err(error) => {
+            let _ = rollback(&state, &project, &service, &mut log).await;
+            let _ = state
+                .storage
+                .finish_failure(&item.id, &error.to_string(), "succeeded", &log)
+                .await;
+        }
+    }
 }
 
 fn begin_log_step(log: &mut String, title: &str) {
@@ -442,8 +652,8 @@ pub async fn rebuild_project_override(
     let runtime = state
         .project_runtime(&project.id)
         .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
-    let versions = versions_from_db(state, project).await?;
-    write_override(&runtime.override_file, &project.services, &versions).await
+    let images = images_from_db(state, project).await?;
+    write_image_override(&runtime.override_file, &project.services, &images).await
 }
 
 pub async fn rebuild_override(state: &AppState) -> anyhow::Result<()> {
@@ -452,6 +662,122 @@ pub async fn rebuild_override(state: &AppState) -> anyhow::Result<()> {
             .project_runtime(&project.id)
             .ok_or_else(|| anyhow::anyhow!("Compose 项目运行时不存在"))?;
         rebuild_project_override(state, &runtime.compose.project()).await?;
+    }
+    Ok(())
+}
+
+pub async fn recover_interrupted(state: &AppState) -> anyhow::Result<()> {
+    for (item, artifact) in state.storage.active_deployments().await? {
+        let Some(runtime) = state.project_runtime(&item.project_id).cloned() else {
+            state
+                .storage
+                .finish_interrupted(
+                    &item.id,
+                    "启动恢复时 Compose 项目已不存在",
+                    "unavailable",
+                    "无法恢复：Compose 项目已不存在\n",
+                )
+                .await?;
+            continue;
+        };
+        let _permit = runtime.deploy_lock.clone().acquire_owned().await?;
+        let project = runtime.compose.project();
+        let Some(service) = project
+            .services
+            .iter()
+            .find(|service| service.id == item.service_id)
+            .cloned()
+        else {
+            state
+                .storage
+                .finish_interrupted(
+                    &item.id,
+                    "启动恢复时 Compose 服务已不存在",
+                    "unavailable",
+                    "无法恢复：Compose 服务已不存在\n",
+                )
+                .await?;
+            continue;
+        };
+        if item.status == "queued" {
+            state
+                .storage
+                .finish_interrupted(
+                    &item.id,
+                    "管理程序重启，尚未开始的操作已取消",
+                    "not_needed",
+                    "操作在开始前因管理程序重启而取消\n",
+                )
+                .await?;
+            continue;
+        }
+        if !matches!(item.operation.as_str(), "deploy" | "rollback") {
+            state
+                .storage
+                .finish_interrupted(
+                    &item.id,
+                    "管理程序在生命周期操作期间重启，请检查容器当前状态",
+                    "unavailable",
+                    "生命周期操作被管理程序重启中断\n",
+                )
+                .await?;
+            continue;
+        }
+
+        let actual = runtime
+            .compose
+            .runtime(&service.id, project.command_timeout())
+            .await;
+        let target_id = artifact
+            .target_image_id
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let target_is_healthy = target_id.is_some()
+            && actual.actual_image_id.as_deref() == target_id
+            && !actual.mixed_images
+            && matches!(actual.container_status.as_str(), "healthy" | "running");
+        if target_is_healthy
+            && matches!(artifact.phase.as_str(), "checking" | "committing")
+            && let (Some(image), Some(pinned), Some(digest), Some(image_id)) = (
+                artifact.target_image.as_deref(),
+                artifact.target_pinned_image.as_deref(),
+                artifact.target_digest.as_deref(),
+                artifact.target_image_id.as_deref(),
+            )
+        {
+            let log = "管理程序重启后确认候选镜像仍在健康运行，已补记部署成功\n";
+            state
+                .storage
+                .finish_artifact_success(
+                    &item.id,
+                    &project.id,
+                    &service.id,
+                    &item.target_version,
+                    image,
+                    pinned,
+                    digest,
+                    image_id,
+                    log,
+                )
+                .await?;
+            rebuild_project_override(state, &project).await?;
+            continue;
+        }
+
+        let mut log = String::from("管理程序重启后无法确认候选部署已安全完成\n");
+        begin_log_step(&mut log, "恢复已提交版本");
+        let rollback_result = rollback(state, &project, &service, &mut log).await;
+        let (rollback_status, message) = match rollback_result {
+            Ok(()) => ("succeeded", "中断部署已恢复到上一个已提交版本"),
+            Err(error) => {
+                let _ = writeln!(log, "启动恢复失败: {error}");
+                ("failed", "中断部署恢复失败，需要人工检查")
+            }
+        };
+        state
+            .storage
+            .finish_interrupted(&item.id, message, rollback_status, &log)
+            .await?;
     }
     Ok(())
 }
@@ -577,14 +903,46 @@ mod tests {
         }
     }
 
+    async fn persist_success(
+        state: &AppState,
+        id: &str,
+        version: &str,
+        digest: &str,
+        image_id: &str,
+    ) {
+        let mut item = queued();
+        item.id = id.into();
+        item.target_version = version.into();
+        state.storage.create_deployment(&item).await.unwrap();
+        state
+            .storage
+            .finish_artifact_success(
+                id,
+                "app",
+                "identity",
+                version,
+                &format!("ghcr.io/owner/identity:{version}"),
+                &format!("ghcr.io/owner/identity@{digest}"),
+                digest,
+                image_id,
+                "",
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn persists_success_after_healthy_container() {
         let dir = tempfile::tempdir().unwrap();
-        let inspect = r#"[{"Config":{"Image":"ghcr.io/owner/identity:1.2.3","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
+        let inspect = r#"[{"Image":"sha256:image","Config":{"Image":"ghcr.io/owner/identity@sha256:digest","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
         let (state, project, service) = state(
             &dir,
             vec![
                 output(true, "pull"),
+                output(
+                    true,
+                    r#"[{"Id":"sha256:image","RepoDigests":["ghcr.io/owner/identity@sha256:digest"]}]"#,
+                ),
                 output(true, "up"),
                 output(true, "container\n"),
                 output(true, inspect),
@@ -618,6 +976,113 @@ mod tests {
                 .desired_version,
             "1.2.3"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_commits_a_healthy_verified_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = r#"[{"Image":"sha256:image","Config":{"Image":"ghcr.io/owner/identity@sha256:digest","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
+        let (state, _, _) = state(
+            &dir,
+            vec![output(true, "container\n"), output(true, inspect)],
+        )
+        .await;
+        let item = queued();
+        state.storage.create_deployment(&item).await.unwrap();
+        state.storage.mark_running(&item.id).await.unwrap();
+        state.storage.set_phase(&item.id, "checking").await.unwrap();
+        state
+            .storage
+            .set_target_artifact(
+                &item.id,
+                "ghcr.io/owner/identity:1.2.3",
+                "ghcr.io/owner/identity@sha256:digest",
+                "sha256:digest",
+                "sha256:image",
+            )
+            .await
+            .unwrap();
+
+        recover_interrupted(&state).await.unwrap();
+
+        let deployment = state.storage.deployment(&item.id).await.unwrap().unwrap();
+        assert_eq!(deployment.status, "succeeded");
+        let service = state
+            .storage
+            .state("app", "identity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.image_digest, "sha256:digest");
+        assert_eq!(service.image_id, "sha256:image");
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_the_previous_successful_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let inspect = r#"[{"Image":"sha256:image-one","Config":{"Image":"ghcr.io/owner/identity@sha256:one","Healthcheck":null},"State":{"Status":"running","Health":null}}]"#;
+        let (state, _, _) = state(
+            &dir,
+            vec![
+                output(true, "up"),
+                output(true, "container\n"),
+                output(true, inspect),
+            ],
+        )
+        .await;
+        persist_success(&state, "first", "1.0.0", "sha256:one", "sha256:image-one").await;
+        let mut second = queued();
+        second.id = "second".into();
+        second.previous_version = Some("1.0.0".into());
+        second.target_version = "2.0.0".into();
+        state.storage.create_deployment(&second).await.unwrap();
+        state
+            .storage
+            .finish_artifact_success(
+                &second.id,
+                "app",
+                "identity",
+                "2.0.0",
+                "ghcr.io/owner/identity:2.0.0",
+                "ghcr.io/owner/identity@sha256:two",
+                "sha256:two",
+                "sha256:image-two",
+                "",
+            )
+            .await
+            .unwrap();
+
+        let operation = enqueue_rollback(state.clone(), "app", "identity")
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let current = state
+                .storage
+                .deployment(&operation.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status != "queued" && current.status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let operation = state
+            .storage
+            .deployment(&operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, "succeeded");
+        assert_eq!(operation.operation, "rollback");
+        let current = state
+            .storage
+            .state("app", "identity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.desired_version, "1.0.0");
+        assert_eq!(current.image_digest, "sha256:one");
     }
 
     #[tokio::test]
@@ -719,18 +1184,14 @@ mod tests {
             ],
         )
         .await;
-        state
-            .storage
-            .finish_success(
-                "baseline",
-                "app",
-                "identity",
-                "1.2.3",
-                "ghcr.io/owner/identity:1.2.3",
-                "",
-            )
-            .await
-            .unwrap();
+        persist_success(
+            &state,
+            "baseline",
+            "1.2.3",
+            "sha256:baseline",
+            "sha256:image-baseline",
+        )
+        .await;
 
         for action in [
             LifecycleAction::Recreate,
@@ -802,12 +1263,15 @@ mod tests {
         state.storage.create_deployment(&item).await.unwrap();
         state
             .storage
-            .finish_success(
+            .finish_artifact_success(
                 &item.id,
                 "app",
                 &service.id,
                 "1.2.3",
                 "ghcr.io/owner/identity:1.2.3",
+                "ghcr.io/owner/identity@sha256:digest",
+                "sha256:digest",
+                "sha256:image",
                 "ok",
             )
             .await
