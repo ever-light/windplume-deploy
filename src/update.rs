@@ -232,7 +232,7 @@ impl UpdateManager {
         )?;
         let expected_name = format!("windplume-deploy-{}-linux-x86_64.tar.gz", release.version);
         let expected_sha = parse_checksum(&checksum, &expected_name)?;
-        let archive_sha = format!("{:x}", Sha256::digest(&archive));
+        let archive_sha = sha256_hex(&archive);
         if archive_sha != expected_sha {
             return Err(AppError::Update("Release SHA-256 校验失败".into()));
         }
@@ -403,6 +403,17 @@ fn parse_checksum(bytes: &[u8], expected_name: &str) -> Result<String, AppError>
     Ok(checksum.to_ascii_lowercase())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn extract_binary(archive: &[u8], version: &str) -> Result<Vec<u8>, AppError> {
     let expected = format!("windplume-deploy-{version}-linux-x86_64/windplume-deploy");
     let decoder = GzDecoder::new(archive);
@@ -530,6 +541,10 @@ mod tests {
     fn validates_checksum_filename_and_digest() {
         let name = "windplume-deploy-0.1.42-linux-x86_64.tar.gz";
         let digest = "a".repeat(64);
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert_eq!(
             parse_checksum(format!("{digest}  {name}\n").as_bytes(), name).unwrap(),
             digest
