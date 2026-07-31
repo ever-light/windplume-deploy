@@ -47,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/system/update", get(system_update).post(start_update))
         .route("/api/system/update/status", get(system_update_status))
+        .route("/api/system/overview", get(system_overview))
+        .route("/api/system/images", get(system_images))
+        .route("/api/system/images/cleanup", post(cleanup_system_images))
+        .route("/api/system/build-cache/cleanup", post(cleanup_build_cache))
         .route("/api/deployments/cleanup", post(cleanup_deployments))
         .route("/api/deployments", get(deployments))
         .route("/api/deployments/{id}", get(deployment))
@@ -488,6 +492,188 @@ async fn system_update_status(State(state): State<AppState>) -> Json<crate::upda
     Json(state.updates.status().await)
 }
 
+async fn system_overview(
+    State(state): State<AppState>,
+) -> Result<Json<crate::system::SystemOverview>, AppError> {
+    state
+        .system
+        .overview()
+        .await
+        .map(Json)
+        .map_err(|error| AppError::System(error.to_string()))
+}
+
+async fn protected_images(
+    state: &AppState,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, AppError> {
+    let mut protected =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for runtime in state.projects.values() {
+        let project = runtime.compose.project();
+        for service in &project.services {
+            let Some(current) = state.storage.state(&project.id, &service.id).await? else {
+                continue;
+            };
+            protected
+                .entry(current.image_id.clone())
+                .or_default()
+                .insert("current".into());
+            if let Some(previous) = state
+                .storage
+                .previous_revision(&project.id, &service.id, &current.last_deployment_id)
+                .await?
+            {
+                protected
+                    .entry(previous.image_id)
+                    .or_default()
+                    .insert("rollback".into());
+            }
+        }
+    }
+    Ok(protected)
+}
+
+fn managed_services(state: &AppState) -> Vec<(String, String, String)> {
+    let mut services = state
+        .projects
+        .values()
+        .flat_map(|runtime| {
+            let project = runtime.compose.project();
+            project
+                .services
+                .into_iter()
+                .map(move |service| (project.id.clone(), service.id, service.image))
+        })
+        .collect::<Vec<_>>();
+    services.sort();
+    services
+}
+
+async fn managed_images(state: &AppState) -> Result<Vec<crate::system::ManagedImage>, AppError> {
+    state
+        .system
+        .images(&managed_services(state), &protected_images(state).await?)
+        .await
+        .map_err(|error| AppError::System(error.to_string()))
+}
+
+async fn system_images(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let images = managed_images(&state).await?;
+    let removable_count = images.iter().filter(|image| image.removable).count();
+    let removable_size_bytes = images
+        .iter()
+        .filter(|image| image.removable)
+        .map(|image| image.size_bytes)
+        .sum::<u64>();
+    Ok(Json(serde_json::json!({
+        "images": images,
+        "removable_count": removable_count,
+        "removable_size_bytes": removable_size_bytes
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageCleanupRequest {
+    image_ids: Vec<String>,
+}
+
+fn validate_image_ids(
+    image_ids: Vec<String>,
+) -> Result<std::collections::BTreeSet<String>, AppError> {
+    let image_ids = image_ids
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if image_ids.is_empty() || image_ids.len() > 100 {
+        return Err(AppError::Invalid("请选择 1 到 100 个镜像".into()));
+    }
+    if image_ids.iter().any(|id| {
+        id.len() != 71
+            || !id.starts_with("sha256:")
+            || !id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(AppError::Invalid("镜像 ID 格式无效".into()));
+    }
+    Ok(image_ids)
+}
+
+fn acquire_maintenance_permits(
+    state: &AppState,
+) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, AppError> {
+    if state.updates.is_active() {
+        return Err(AppError::Updating);
+    }
+    let mut runtimes = state.projects.values().collect::<Vec<_>>();
+    runtimes.sort_by_key(|runtime| runtime.compose.project().id);
+    let mut permits = Vec::new();
+    for runtime in runtimes {
+        permits.push(
+            runtime
+                .deploy_lock
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| AppError::Busy)?,
+        );
+    }
+    Ok(permits)
+}
+
+async fn cleanup_system_images(
+    State(state): State<AppState>,
+    payload: Result<Json<ImageCleanupRequest>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Json(payload) =
+        payload.map_err(|error| AppError::Invalid(format!("JSON 请求无效: {error}")))?;
+    let requested = validate_image_ids(payload.image_ids)?;
+    let _permits = acquire_maintenance_permits(&state)?;
+    let candidates = managed_images(&state)
+        .await?
+        .into_iter()
+        .filter(|image| image.removable)
+        .map(|image| image.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(id) = requested.iter().find(|id| !candidates.contains(*id)) {
+        return Err(AppError::Invalid(format!(
+            "镜像已被引用、已不存在或不属于受管 Compose：{id}"
+        )));
+    }
+
+    let mut deleted_ids = Vec::new();
+    let mut failed = Vec::new();
+    for id in requested {
+        match state.system.remove_image(&id).await {
+            Ok(log) => {
+                tracing::info!(image_id=%id, output=%log.trim(), "removed managed Docker image");
+                deleted_ids.push(id);
+            }
+            Err(error) => {
+                tracing::warn!(image_id=%id, error=%error, "cannot remove managed Docker image");
+                failed.push(serde_json::json!({"id": id, "message": error.to_string()}));
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "deleted_ids": deleted_ids,
+        "failed": failed
+    })))
+}
+
+async fn cleanup_build_cache(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _permits = acquire_maintenance_permits(&state)?;
+    let output = state
+        .system
+        .prune_build_cache()
+        .await
+        .map_err(|error| AppError::System(error.to_string()))?;
+    tracing::info!(output=%output.trim(), "pruned Docker build cache older than seven days");
+    Ok(Json(serde_json::json!({
+        "retention_days": 7,
+        "output": output.trim()
+    })))
+}
+
 async fn start_update(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     if !state.updates.self_update_supported() {
         return Err(AppError::Update(
@@ -600,6 +786,7 @@ mod tests {
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
+        system::SystemManager,
         update::UpdateManager,
     };
     use axum::{
@@ -723,6 +910,7 @@ mod tests {
             config,
             storage,
             registry,
+            system: SystemManager::new(dir.path().into(), Arc::new(ProcessRunner)),
             updates: UpdateManager::new(dir.path().into()).unwrap(),
             projects: Arc::new(HashMap::from([("app".into(), runtime)])),
         })
@@ -771,6 +959,7 @@ mod tests {
                 config,
                 storage,
                 registry: RegistryClient::new(Duration::from_secs(60)).unwrap(),
+                system: SystemManager::new(dir.path().into(), runner.clone()),
                 updates: UpdateManager::new(dir.path().into()).unwrap(),
                 projects: Arc::new(HashMap::from([("app".into(), runtime)])),
             },
@@ -819,6 +1008,9 @@ mod tests {
         assert!(!js.contains("<span>一致性</span>"));
         assert!(js.contains("currentTail === 50 ? 100 : maxTail"));
         assert!(js.contains("/api/deployments/cleanup"));
+        assert!(js.contains("/api/system/overview"));
+        assert!(js.contains("/api/system/images/cleanup"));
+        assert!(js.contains("/api/system/build-cache/cleanup"));
 
         let index = app
             .clone()
@@ -834,6 +1026,8 @@ mod tests {
         .unwrap();
         assert!(index.contains(">刷新版本</button>"));
         assert!(index.contains("系统更新"));
+        assert!(index.contains("系统空间与镜像"));
+        assert!(index.contains("受管 Compose 镜像"));
         assert!(index.contains("清除 30 天前记录"));
         assert!(!index.contains("<th>更新时间</th>"));
         assert!(!index.contains("<th>Digest</th>"));
@@ -1025,5 +1219,101 @@ mod tests {
                 .iter()
                 .all(|args| !args.iter().any(|arg| arg == "up" || arg == "pull"))
         );
+    }
+
+    #[tokio::test]
+    async fn image_cleanup_revalidates_and_removes_only_an_unreferenced_managed_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        let image_row = serde_json::json!({
+            "Containers": "0",
+            "CreatedAt": "2026-07-30 00:00:00 +0000 UTC",
+            "Digest": "sha256:old",
+            "ID": image_id,
+            "Repository": "nginx",
+            "Size": "100MB",
+            "Tag": "1.0.0"
+        })
+        .to_string();
+        let outputs = vec![
+            CommandOutput {
+                success: true,
+                log: image_row,
+            },
+            CommandOutput {
+                success: true,
+                log: "Deleted".into(),
+            },
+        ];
+        let (state, runner) = refresh_state(&dir, outputs).await;
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/system/images/cleanup")
+                    .header("x-windplume-csrf", csrf_token(&app).await)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"image_ids": [image_id]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            [
+                "image",
+                "ls",
+                "--digests",
+                "--no-trunc",
+                "--format",
+                "{{json .}}"
+            ]
+        );
+        assert_eq!(calls[1][..2], ["image", "rm"]);
+    }
+
+    #[tokio::test]
+    async fn image_cleanup_rejects_an_image_referenced_by_a_stopped_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_id = format!("sha256:{}", "b".repeat(64));
+        let image_row = serde_json::json!({
+            "Containers": "1",
+            "CreatedAt": "2026-07-30 00:00:00 +0000 UTC",
+            "Digest": "sha256:used",
+            "ID": image_id,
+            "Repository": "nginx",
+            "Size": "100MB",
+            "Tag": "1.0.0"
+        })
+        .to_string();
+        let (state, runner) = refresh_state(
+            &dir,
+            vec![CommandOutput {
+                success: true,
+                log: image_row,
+            }],
+        )
+        .await;
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/system/images/cleanup")
+                    .header("x-windplume-csrf", csrf_token(&app).await)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"image_ids": [image_id]}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 }

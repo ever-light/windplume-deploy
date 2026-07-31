@@ -9,6 +9,7 @@ let containerLogsRequest = 0;
 let csrfToken = null;
 let projectsLoading = false;
 let historyLoading = false;
+let systemResourcesLoading = false;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -67,6 +68,185 @@ function badge(status) {
     status,
   );
   return `<span class="pill ${ok ? "ok" : bad ? "bad" : ""}">${esc(status)}</span>`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const index = Math.min(
+    Math.floor(Math.log(value) / Math.log(1024)),
+    units.length - 1,
+  );
+  const scaled = value / 1024 ** index;
+  return `${scaled >= 10 || index === 0 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function formatUptime(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return `${days ? `${days} 天 ` : ""}${hours} 小时 ${minutes} 分`;
+}
+
+function protectedReason(reason) {
+  return (
+    {
+      container: "容器引用",
+      current: "当前部署",
+      rollback: "回退版本",
+    }[reason] || reason
+  );
+}
+
+function metric(label, value, detail = "") {
+  return `<article><span>${esc(label)}</span><strong>${esc(value)}</strong>${detail ? `<small>${esc(detail)}</small>` : ""}</article>`;
+}
+
+function updateImageCleanupButton() {
+  const selected = document.querySelectorAll(".image-select:checked").length;
+  const button = $("#image-cleanup");
+  button.disabled = selected === 0;
+  button.textContent = selected ? `清理选中镜像（${selected}）` : "清理选中镜像";
+}
+
+async function loadSystemResources() {
+  if (systemResourcesLoading) return;
+  systemResourcesLoading = true;
+  $("#system-resources-refresh").disabled = true;
+  try {
+    const [overview, inventory] = await Promise.all([
+      api("/api/system/overview"),
+      api("/api/system/images"),
+    ]);
+    const diskDetail = `已用 ${formatBytes(overview.disk.used_bytes)}，可用 ${formatBytes(overview.disk.available_bytes)}`;
+    const memoryDetail = `可用 ${formatBytes(overview.memory.available_bytes)}`;
+    $("#system-metrics").innerHTML = [
+      metric("系统盘", `${overview.disk.used_percent.toFixed(0)}%`, diskDetail),
+      metric(
+        "内存",
+        `${overview.memory.used_percent.toFixed(0)}%`,
+        memoryDetail,
+      ),
+      metric(
+        "Docker 镜像",
+        `${overview.docker.images.total} 个 · ${formatBytes(overview.docker.images.size_bytes)}`,
+        `可回收约 ${formatBytes(overview.docker.images.reclaimable_bytes)}`,
+      ),
+      metric(
+        "构建缓存",
+        formatBytes(overview.docker.build_cache.size_bytes),
+        `7 天前缓存可手动清理；Docker 估算可回收 ${formatBytes(overview.docker.build_cache.reclaimable_bytes)}`,
+      ),
+      metric(
+        "系统负载",
+        overview.load_average.map((value) => value.toFixed(2)).join(" / "),
+        "1 / 5 / 15 分钟",
+      ),
+      metric("运行时间", formatUptime(overview.uptime_seconds)),
+    ].join("");
+    $("#build-cache-cleanup").disabled =
+      overview.docker.build_cache.reclaimable_bytes === 0;
+    $("#image-cleanup-summary").textContent =
+      `识别到 ${inventory.images.length} 个受管镜像，其中 ${inventory.removable_count} 个当前可清理，标称大小合计 ${formatBytes(inventory.removable_size_bytes)}；共享层会影响实际释放空间。`;
+    $("#managed-images").innerHTML =
+      inventory.images
+        .map((image) => {
+          const services = image.services
+            .map((service) => `${service.project_id} / ${service.service_id}`)
+            .join("，");
+          const status = image.removable
+            ? '<span class="pill">可清理</span>'
+            : image.protected_reasons
+                .map((reason) => `<span class="pill ok">${esc(protectedReason(reason))}</span>`)
+                .join(" ");
+          return `<tr>
+            <td class="check-cell"><input class="image-select" type="checkbox" value="${esc(image.id)}" ${image.removable ? "" : "disabled"} aria-label="选择 ${esc(image.repository)}:${esc(image.tag)}"></td>
+            <td><div class="image-name"><code>${esc(image.repository)}:${esc(image.tag)}</code><span class="muted">${esc(image.id.slice(0, 19))}…</span></div></td>
+            <td>${esc(services)}</td>
+            <td>${esc(formatBytes(image.size_bytes))}</td>
+            <td>${esc(image.created_at)}</td>
+            <td>${status}</td>
+          </tr>`;
+        })
+        .join("") || '<tr><td colspan="6">本机没有受管 Compose 镜像</td></tr>';
+    document.querySelectorAll(".image-select").forEach((checkbox) => {
+      checkbox.onchange = updateImageCleanupButton;
+    });
+    updateImageCleanupButton();
+  } catch (error) {
+    diagnose("系统空间与镜像", error.message);
+    $("#system-metrics").innerHTML =
+      metric("读取失败", error.message);
+    $("#managed-images").innerHTML =
+      `<tr><td colspan="6" class="drift">${esc(error.message)}</td></tr>`;
+    $("#image-cleanup-summary").textContent = "系统资源读取失败";
+    $("#image-cleanup").disabled = true;
+    $("#build-cache-cleanup").disabled = true;
+  } finally {
+    $("#system-resources-refresh").disabled = false;
+    systemResourcesLoading = false;
+  }
+}
+
+async function cleanupImages() {
+  const imageIds = [
+    ...new Set(
+      [...document.querySelectorAll(".image-select:checked")].map(
+        (checkbox) => checkbox.value,
+      ),
+    ),
+  ];
+  if (!imageIds.length) return;
+  if (
+    !window.confirm(
+      `确定删除选中的 ${imageIds.length} 个镜像吗？\n\n服务会在删除前重新检查容器、当前部署和回退版本引用。此操作不可恢复。`,
+    )
+  ) {
+    return;
+  }
+  $("#image-cleanup").disabled = true;
+  try {
+    const result = await api("/api/system/images/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_ids: imageIds }),
+    });
+    if (result.failed.length) {
+      diagnose(
+        "镜像清理",
+        result.failed.map((item) => `${item.id}: ${item.message}`).join("\n"),
+      );
+    }
+    toast(
+      `已删除 ${result.deleted_ids.length} 个镜像` +
+        (result.failed.length ? `，${result.failed.length} 个删除失败` : ""),
+    );
+    await loadSystemResources();
+  } catch (error) {
+    diagnose("镜像清理", error.message);
+    toast(error.message);
+    updateImageCleanupButton();
+  }
+}
+
+async function cleanupBuildCache() {
+  if (
+    !window.confirm(
+      "确定清理 7 天前未使用的 Docker 构建缓存吗？\n\n不会删除镜像、容器或卷，但之后构建可能需要重新下载依赖。",
+    )
+  ) {
+    return;
+  }
+  $("#build-cache-cleanup").disabled = true;
+  try {
+    await api("/api/system/build-cache/cleanup", { method: "POST" });
+    toast("构建缓存清理完成");
+    await loadSystemResources();
+  } catch (error) {
+    diagnose("构建缓存清理", error.message);
+    toast(error.message);
+  }
 }
 
 function serviceCard(project, service) {
@@ -566,11 +746,15 @@ $("#history-refresh").onclick = loadHistory;
 $("#history-cleanup").onclick = cleanupHistory;
 $("#update-check").onclick = () => loadSystemUpdate(true);
 $("#update-install").onclick = confirmSystemUpdate;
+$("#system-resources-refresh").onclick = loadSystemResources;
+$("#image-cleanup").onclick = cleanupImages;
+$("#build-cache-cleanup").onclick = cleanupBuildCache;
 $("#diagnostics-clear").onclick = () => {
   diagnostics = [];
   $("#diagnostics").textContent = "（暂无诊断信息）";
 };
 loadProjects();
+loadSystemResources();
 loadHistory();
 loadSystemUpdate();
 setInterval(() => {

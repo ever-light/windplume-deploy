@@ -19,6 +19,8 @@ pub enum AppError {
     Internal(String),
     #[error("无法更新程序: {0}")]
     Update(String),
+    #[error("无法读取或清理系统资源: {0}")]
+    System(String),
 }
 
 #[derive(Serialize)]
@@ -60,6 +62,11 @@ impl IntoResponse for AppError {
             Self::Update(_) => (
                 StatusCode::BAD_GATEWAY,
                 "system_update_failed",
+                self.to_string(),
+            ),
+            Self::System(_) => (
+                StatusCode::BAD_GATEWAY,
+                "system_resource_failed",
                 self.to_string(),
             ),
         };

@@ -5,6 +5,7 @@ mod error;
 mod registry;
 mod state;
 mod storage;
+mod system;
 mod update;
 mod web;
 use clap::Parser;
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         registry::RegistryClient::new(Duration::from_secs(cfg.registries.cache_seconds))?;
     let updates =
         update::UpdateManager::new(update::UpdateManager::runtime_root(&cfg.storage.data_dir))?;
+    let system = system::SystemManager::new(cfg.storage.data_dir.clone(), runner.clone());
     let projects = cfg
         .projects
         .iter()
@@ -75,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         config: cfg.clone(),
         storage,
         registry,
+        system,
         updates,
         projects: Arc::new(projects),
     };

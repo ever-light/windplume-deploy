@@ -404,7 +404,7 @@ impl Compose {
     }
 }
 
-fn repositories_match(left: &str, right: &str) -> bool {
+pub(crate) fn repositories_match(left: &str, right: &str) -> bool {
     fn normalized(value: &str) -> String {
         let value = value
             .trim_start_matches("docker.io/")

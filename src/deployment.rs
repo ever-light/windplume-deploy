@@ -791,6 +791,7 @@ mod tests {
         registry::RegistryClient,
         state::ProjectRuntime,
         storage::Storage,
+        system::SystemManager,
         update::UpdateManager,
     };
     use std::{
@@ -854,12 +855,9 @@ mod tests {
         let storage = Storage::open(dir.path(), 10, 1024).await.unwrap();
         let registry = RegistryClient::new(Duration::from_secs(60)).unwrap();
         let override_file = dir.path().join("override.yaml");
+        let runner = Arc::new(FakeRunner(Mutex::new(outputs)));
         let runtime = ProjectRuntime {
-            compose: Compose::new(
-                project.clone(),
-                override_file.clone(),
-                Arc::new(FakeRunner(Mutex::new(outputs))),
-            ),
+            compose: Compose::new(project.clone(), override_file.clone(), runner.clone()),
             override_file,
             deploy_lock: Arc::new(Semaphore::new(1)),
         };
@@ -868,6 +866,7 @@ mod tests {
                 config,
                 storage,
                 registry,
+                system: SystemManager::new(dir.path().into(), runner),
                 updates: UpdateManager::new(dir.path().into()).unwrap(),
                 projects: Arc::new(HashMap::from([("app".into(), runtime)])),
             },

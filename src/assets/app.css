@@ -17,6 +17,18 @@ section{margin-bottom:34px}
 .kv{display:grid;grid-template-columns:82px 1fr;gap:7px;margin-top:15px}
 .update-grid{display:grid;grid-template-columns:110px 1fr;gap:8px;margin-top:15px;background:white;border:1px solid var(--line);border-radius:10px;padding:16px}
 .update-grid span{color:var(--muted)}
+.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:15px}
+.metric-grid article{background:white;border:1px solid var(--line);border-radius:10px;padding:15px;display:flex;flex-direction:column;gap:4px}
+.metric-grid span{color:var(--muted);font-size:12px}
+.metric-grid strong{font-size:16px}
+.metric-grid small{color:var(--muted)}
+.resource-subhead{margin-top:22px}
+.resource-subhead h3{margin:0}
+.check-cell{width:42px;text-align:center}
+.check-cell input{width:16px;height:16px}
+.image-name{display:flex;flex-direction:column;gap:2px;min-width:230px}
+.image-name code{font-size:13px}
+.resource-warning{color:#b54708}
 .kv span:nth-child(odd){color:var(--muted)}
 code{word-break:break-all;font-size:12px}
 .pill{display:inline-block;border-radius:999px;padding:3px 9px;background:#344054;color:white;font-size:12px}
@@ -41,4 +53,4 @@ pre{white-space:pre-wrap;max-height:55vh;overflow:auto;background:#101828;color:
 .log-dialog{width:min(61.8vw,1180px);max-width:calc(100vw - 32px)}
 .log-dialog .log-content{height:55vh;max-height:55vh;margin-bottom:0}
 #toast{position:fixed;right:20px;bottom:20px;background:#101828;color:white;padding:10px 14px;border-radius:8px;display:none}
-@media(max-width:600px){header{padding:18px}main{padding:20px 12px}.cards{grid-template-columns:1fr}.project-head{align-items:flex-start;flex-direction:column}.log-dialog{width:calc(100vw - 24px);max-width:calc(100vw - 24px)}.log-dialog .log-content{height:60vh;max-height:60vh}}
+@media(max-width:600px){header{padding:18px}main{padding:20px 12px}.cards{grid-template-columns:1fr}.project-head,.resource-subhead{align-items:flex-start;flex-direction:column}.metric-grid{grid-template-columns:1fr 1fr}.log-dialog{width:calc(100vw - 24px);max-width:calc(100vw - 24px)}.log-dialog .log-content{height:60vh;max-height:60vh}}
