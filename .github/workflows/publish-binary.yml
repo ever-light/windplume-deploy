@@ -16,6 +16,7 @@ jobs:
   quality:
     uses: ./.github/workflows/ci.yml
     permissions:
+      checks: write
       contents: read
 
   release:
