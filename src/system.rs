@@ -51,7 +51,7 @@ pub struct DockerResourceUsage {
     pub reclaimable_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ImageReference {
     pub project_id: String,
     pub service_id: String,
@@ -63,12 +63,20 @@ pub struct ManagedImage {
     pub repository: String,
     pub tag: String,
     pub digest: Option<String>,
+    pub aliases: Vec<ImageAlias>,
     pub size_bytes: u64,
     pub created_at: String,
     pub containers: u64,
     pub services: Vec<ImageReference>,
     pub protected_reasons: Vec<String>,
     pub removable: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ImageAlias {
+    pub repository: String,
+    pub tag: String,
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,8 +107,6 @@ struct DockerImageRow {
     size: String,
     #[serde(rename = "CreatedAt")]
     created_at: String,
-    #[serde(rename = "Containers")]
-    containers: String,
 }
 
 impl SystemManager {
@@ -146,7 +152,8 @@ impl SystemManager {
                 "{{json .}}",
             ])
             .await?;
-        parse_images(&output, services, protected)
+        let container_images = self.container_image_counts().await?;
+        parse_images(&output, services, protected, &container_images)
     }
 
     pub async fn remove_image(&self, image_id: &str) -> anyhow::Result<String> {
@@ -179,14 +186,48 @@ impl SystemManager {
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>();
+        self.run_docker_args(&args).await
+    }
+
+    async fn run_docker_args(&self, args: &[String]) -> anyhow::Result<String> {
         let output = self
             .runner
-            .run("docker", &args, &self.cwd, COMMAND_TIMEOUT)
+            .run("docker", args, &self.cwd, COMMAND_TIMEOUT)
             .await?;
         if !output.success {
             anyhow::bail!("Docker 命令执行失败: {}", output.log.trim());
         }
         Ok(output.log)
+    }
+
+    async fn container_image_counts(&self) -> anyhow::Result<BTreeMap<String, u64>> {
+        let output = self
+            .run_docker(&["container", "ls", "--all", "--quiet", "--no-trunc"])
+            .await?;
+        let container_ids = output
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let mut counts = BTreeMap::new();
+        for chunk in container_ids.chunks(100) {
+            let mut args = vec![
+                "container".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.Image}}".into(),
+            ];
+            args.extend(chunk.iter().map(|value| (*value).to_owned()));
+            let images = self.run_docker_args(&args).await?;
+            for image_id in images
+                .lines()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                *counts.entry(image_id.to_owned()).or_default() += 1;
+            }
+        }
+        Ok(counts)
     }
 }
 
@@ -289,33 +330,66 @@ fn parse_images(
     value: &str,
     services: &[(String, String, String)],
     protected: &BTreeMap<String, BTreeSet<String>>,
+    container_images: &BTreeMap<String, u64>,
 ) -> anyhow::Result<Vec<ManagedImage>> {
-    let mut images = Vec::new();
+    let mut rows = BTreeMap::<String, Vec<DockerImageRow>>::new();
     for line in value.lines().filter(|line| !line.trim().is_empty()) {
         let row: DockerImageRow = serde_json::from_str(line)?;
-        let references = services
+        rows.entry(row.id.clone()).or_default().push(row);
+    }
+    let mut images = Vec::new();
+    for (id, rows) in rows {
+        let references = rows
             .iter()
-            .filter(|(_, _, repository)| repositories_match(&row.repository, repository))
-            .map(|(project_id, service_id, _)| ImageReference {
-                project_id: project_id.clone(),
-                service_id: service_id.clone(),
+            .flat_map(|row| {
+                services
+                    .iter()
+                    .filter(|(_, _, repository)| repositories_match(&row.repository, repository))
+                    .map(|(project_id, service_id, _)| ImageReference {
+                        project_id: project_id.clone(),
+                        service_id: service_id.clone(),
+                    })
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         if references.is_empty() {
             continue;
         }
-        let containers = row.containers.parse()?;
-        let mut reasons = protected.get(&row.id).cloned().unwrap_or_default();
+        let aliases = rows
+            .iter()
+            .map(|row| ImageAlias {
+                repository: row.repository.clone(),
+                tag: row.tag.clone(),
+                digest: (row.digest != "<none>").then(|| row.digest.clone()),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let primary = rows
+            .iter()
+            .find(|row| {
+                services
+                    .iter()
+                    .any(|(_, _, repository)| repositories_match(&row.repository, repository))
+            })
+            .expect("managed image must have a matching row");
+        let containers = container_images.get(&id).copied().unwrap_or(0);
+        let mut reasons = protected.get(&id).cloned().unwrap_or_default();
         if containers > 0 {
             reasons.insert("container".into());
         }
+        if aliases.len() > 1 {
+            reasons.insert("multiple_tags".into());
+        }
         images.push(ManagedImage {
-            id: row.id,
-            repository: row.repository,
-            tag: row.tag,
-            digest: (row.digest != "<none>").then_some(row.digest),
-            size_bytes: parse_size(&row.size)?,
-            created_at: row.created_at,
+            id,
+            repository: primary.repository.clone(),
+            tag: primary.tag.clone(),
+            digest: (primary.digest != "<none>").then(|| primary.digest.clone()),
+            aliases,
+            size_bytes: parse_size(&primary.size)?,
+            created_at: primary.created_at.clone(),
             containers,
             services: references,
             removable: reasons.is_empty(),
@@ -391,17 +465,30 @@ mod tests {
 
     #[test]
     fn only_lists_managed_repositories_and_protects_referenced_images() {
-        let rows = r#"{"Containers":"0","CreatedAt":"2026-07-30 00:00:00 +0000 UTC","Digest":"sha256:old","ID":"sha256:old","Repository":"ghcr.io/me/app","Size":"100MB","Tag":"1.0.0"}
-{"Containers":"1","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:current","ID":"sha256:current","Repository":"ghcr.io/me/app","Size":"110MB","Tag":"1.1.0"}
-{"Containers":"0","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:other","ID":"sha256:other","Repository":"other/app","Size":"90MB","Tag":"latest"}"#;
+        let rows = r#"{"Containers":"N/A","CreatedAt":"2026-07-30 00:00:00 +0000 UTC","Digest":"sha256:old","ID":"sha256:old","Repository":"ghcr.io/me/app","Size":"100MB","Tag":"1.0.0"}
+{"Containers":"N/A","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:current","ID":"sha256:current","Repository":"ghcr.io/me/app","Size":"110MB","Tag":"1.1.0"}
+{"Containers":"N/A","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:other","ID":"sha256:other","Repository":"other/app","Size":"90MB","Tag":"latest"}"#;
         let services = vec![("project".into(), "web".into(), "ghcr.io/me/app".into())];
         let mut protected = BTreeMap::new();
         protected.insert("sha256:old".into(), BTreeSet::from(["rollback".into()]));
-        let images = parse_images(rows, &services, &protected).unwrap();
+        let containers = BTreeMap::from([("sha256:current".into(), 1)]);
+        let images = parse_images(rows, &services, &protected, &containers).unwrap();
         assert_eq!(images.len(), 2);
         assert!(!images[0].removable);
         assert_eq!(images[0].protected_reasons, ["container"]);
         assert!(!images[1].removable);
         assert_eq!(images[1].protected_reasons, ["rollback"]);
+    }
+
+    #[test]
+    fn merges_aliases_for_the_same_image_id_and_does_not_double_count_it() {
+        let rows = r#"{"Containers":"N/A","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:same","ID":"sha256:same","Repository":"ghcr.io/me/app","Size":"100MB","Tag":"1.0.0"}
+{"Containers":"N/A","CreatedAt":"2026-07-31 00:00:00 +0000 UTC","Digest":"sha256:same","ID":"sha256:same","Repository":"ghcr.io/me/app","Size":"100MB","Tag":"latest"}"#;
+        let services = vec![("project".into(), "web".into(), "ghcr.io/me/app".into())];
+        let images = parse_images(rows, &services, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].aliases.len(), 2);
+        assert_eq!(images[0].protected_reasons, ["multiple_tags"]);
+        assert!(!images[0].removable);
     }
 }

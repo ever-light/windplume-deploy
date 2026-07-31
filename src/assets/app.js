@@ -98,6 +98,7 @@ function protectedReason(reason) {
       container: "容器引用",
       current: "当前部署",
       rollback: "回退版本",
+      multiple_tags: "存在多个标签",
     }[reason] || reason
   );
 }
@@ -178,9 +179,12 @@ async function loadSystemResources() {
             : image.protected_reasons
                 .map((reason) => `<span class="pill ok">${esc(protectedReason(reason))}</span>`)
                 .join(" ");
+          const aliases = image.aliases
+            .map((alias) => `${alias.repository}:${alias.tag}`)
+            .join("，");
           return `<tr>
             <td class="check-cell"><input class="image-select" type="checkbox" value="${esc(image.id)}" ${image.removable ? "" : "disabled"} aria-label="选择 ${esc(image.repository)}:${esc(image.tag)}"></td>
-            <td><div class="image-name"><code>${esc(image.repository)}:${esc(image.tag)}</code><span class="muted">${esc(image.id.slice(0, 19))}…</span></div></td>
+            <td><div class="image-name"><code>${esc(aliases)}</code><span class="muted">${esc(image.id.slice(0, 19))}…</span></div></td>
             <td>${esc(services)}</td>
             <td>${esc(formatBytes(image.size_bytes))}</td>
             <td>${esc(image.created_at)}</td>

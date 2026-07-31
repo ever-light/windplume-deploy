@@ -56,6 +56,7 @@ impl RuntimeStateCache {
     pub fn complete(&self, result: anyhow::Result<BTreeMap<String, RuntimeState>>) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.refreshing = false;
+        inner.last_attempt = Some(Instant::now());
         match result {
             Ok(states) => {
                 inner.states = Some(states);
@@ -130,6 +131,14 @@ mod tests {
         assert!(!cached.start_refresh);
         assert!(!cached.refreshing);
         assert_eq!(cached.states.unwrap()["api"].container_status, "healthy");
+
+        let slow_cache = RuntimeStateCache::default();
+        slow_cache.snapshot(Duration::from_secs(10));
+        slow_cache.inner.lock().unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(20));
+        slow_cache.complete(Ok(BTreeMap::new()));
+        let completed = slow_cache.snapshot(Duration::from_secs(10));
+        assert!(!completed.start_refresh);
 
         cache.invalidate();
         let invalidated = cache.snapshot(Duration::from_secs(10));

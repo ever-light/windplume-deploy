@@ -1304,7 +1304,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let image_id = format!("sha256:{}", "a".repeat(64));
         let image_row = serde_json::json!({
-            "Containers": "0",
+            "Containers": "N/A",
             "CreatedAt": "2026-07-30 00:00:00 +0000 UTC",
             "Digest": "sha256:old",
             "ID": image_id,
@@ -1317,6 +1317,10 @@ mod tests {
             CommandOutput {
                 success: true,
                 log: image_row,
+            },
+            CommandOutput {
+                success: true,
+                log: String::new(),
             },
             CommandOutput {
                 success: true,
@@ -1340,7 +1344,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(
             calls[0],
             [
@@ -1352,7 +1356,8 @@ mod tests {
                 "{{json .}}"
             ]
         );
-        assert_eq!(calls[1][..2], ["image", "rm"]);
+        assert_eq!(calls[1][..2], ["container", "ls"]);
+        assert_eq!(calls[2][..2], ["image", "rm"]);
     }
 
     #[tokio::test]
@@ -1360,7 +1365,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let image_id = format!("sha256:{}", "b".repeat(64));
         let image_row = serde_json::json!({
-            "Containers": "1",
+            "Containers": "N/A",
             "CreatedAt": "2026-07-30 00:00:00 +0000 UTC",
             "Digest": "sha256:used",
             "ID": image_id,
@@ -1371,10 +1376,20 @@ mod tests {
         .to_string();
         let (state, runner) = refresh_state(
             &dir,
-            vec![CommandOutput {
-                success: true,
-                log: image_row,
-            }],
+            vec![
+                CommandOutput {
+                    success: true,
+                    log: image_row,
+                },
+                CommandOutput {
+                    success: true,
+                    log: "container-id".into(),
+                },
+                CommandOutput {
+                    success: true,
+                    log: format!("{image_id}\n"),
+                },
+            ],
         )
         .await;
         let app = router(state);
@@ -1392,6 +1407,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1][..2], ["container", "ls"]);
+        assert_eq!(calls[2][..2], ["container", "inspect"]);
     }
 }
