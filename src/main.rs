@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
                     ),
                     override_file,
                     deploy_lock: Arc::new(Semaphore::new(1)),
+                    runtime_cache: Default::default(),
                 },
             )
         })

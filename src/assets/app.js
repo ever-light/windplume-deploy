@@ -11,6 +11,7 @@ let projectsLoading = false;
 let historyLoading = false;
 let systemResourcesLoading = false;
 let systemResourcesLoaded = false;
+let runtimeRefreshTimer = null;
 
 const esc = (value) =>
   String(value ?? "—").replace(
@@ -68,7 +69,8 @@ function badge(status) {
   const bad = ["unhealthy", "failed", "exited", "dead", "interrupted"].includes(
     status,
   );
-  return `<span class="pill ${ok ? "ok" : bad ? "bad" : ""}">${esc(status)}</span>`;
+  const label = status === "loading" ? "读取中" : status;
+  return `<span class="pill ${ok ? "ok" : bad ? "bad" : ""}">${esc(label)}</span>`;
 }
 
 function formatBytes(bytes) {
@@ -297,11 +299,15 @@ function serviceCard(project, service) {
       ? `<span>镜像状态</span><span class="drift">运行镜像偏离部署基线</span>
          <span>基线镜像</span><code>${esc(service.desired_image)}</code>`
       : "";
-  const runningImage = service.replicas > 1 && !service.actual_image
-    ? "多个副本镜像不一致"
-    : service.actual_image;
+  const runningImage = service.container_status === "loading"
+    ? "正在读取…"
+    : service.replicas > 1 && !service.actual_image
+      ? "多个副本镜像不一致"
+      : service.actual_image;
   const busy = project.deployment_in_progress;
-  const missing = ["down", "unknown"].includes(service.container_status);
+  const missing = ["down", "unknown", "loading"].includes(
+    service.container_status,
+  );
   const stopped = ["exited", "dead"].includes(service.container_status);
   return `<article class="card" data-project="${esc(project.id)}" data-service="${esc(service.id)}">
     <div class="card-head">
@@ -328,6 +334,16 @@ async function loadProjects() {
   projectsLoading = true;
   try {
     projects = await api("/api/projects");
+    if (runtimeRefreshTimer) {
+      clearTimeout(runtimeRefreshTimer);
+      runtimeRefreshTimer = null;
+    }
+    if (
+      !document.hidden &&
+      projects.some((project) => project.runtime_refreshing)
+    ) {
+      runtimeRefreshTimer = setTimeout(loadProjects, 1000);
+    }
     const busyCount = projects.filter((project) => project.deployment_in_progress).length;
     $("#global").textContent = busyCount ? `${busyCount} 个项目操作中` : "空闲";
     $("#global").className = `pill ${busyCount ? "" : "ok"}`;
@@ -337,7 +353,7 @@ async function loadProjects() {
           (project) => `<section class="project-block">
             <div class="project-head">
               <div><h3>${esc(project.id)}</h3><p class="muted">${esc(project.compose_files.join(", "))}</p></div>
-              <div class="actions"><button class="refresh-compose" data-project="${esc(project.id)}" ${project.deployment_in_progress ? "disabled" : ""}>刷新 Compose</button>${project.deployment_in_progress ? badge("操作中") : ""}</div>
+              <div class="actions"><button class="refresh-compose" data-project="${esc(project.id)}" ${project.deployment_in_progress ? "disabled" : ""}>刷新 Compose</button>${project.deployment_in_progress ? badge("操作中") : project.runtime_refreshing ? badge("状态刷新中") : project.runtime_error ? `<span class="pill bad" title="${esc(project.runtime_error)}">状态读取失败</span>` : ""}</div>
             </div>
             <div class="cards">${project.services.map((service) => serviceCard(project, service)).join("")}</div>
           </section>`,
@@ -798,6 +814,17 @@ loadHistory();
 loadSystemUpdate();
 selectTopTab(window.location.hash === "#system" ? "system" : "deploy", false);
 setInterval(() => {
-  loadProjects();
-  loadHistory();
+  if (!document.hidden) {
+    loadProjects();
+    loadHistory();
+  }
 }, 10000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    loadProjects();
+    loadHistory();
+  } else if (runtimeRefreshTimer) {
+    clearTimeout(runtimeRefreshTimer);
+    runtimeRefreshTimer = null;
+  }
+});

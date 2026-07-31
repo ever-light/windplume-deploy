@@ -14,6 +14,23 @@ use std::{
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
+struct RuntimeCacheInvalidator(crate::state::RuntimeStateCache);
+
+impl Drop for RuntimeCacheInvalidator {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
+fn invalidate_runtime_on_exit(
+    state: &AppState,
+    project_id: &str,
+) -> Option<RuntimeCacheInvalidator> {
+    state
+        .project_runtime(project_id)
+        .map(|runtime| RuntimeCacheInvalidator(runtime.runtime_cache.clone()))
+}
+
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
@@ -214,6 +231,7 @@ async fn run_lifecycle(
     item: Deployment,
     _permit: OwnedSemaphorePermit,
 ) {
+    let _runtime_cache = invalidate_runtime_on_exit(&state, &project.id);
     if let Err(error) = state.storage.mark_running(&item.id).await {
         tracing::error!(operation_id=%item.id,error=%error,"cannot mark lifecycle operation running");
         return;
@@ -320,6 +338,7 @@ async fn run(
     item: Deployment,
     _permit: OwnedSemaphorePermit,
 ) {
+    let _runtime_cache = invalidate_runtime_on_exit(&state, &project.id);
     if let Err(error) = state.storage.mark_running(&item.id).await {
         tracing::error!(deployment_id=%item.id,error=%error,"cannot mark deployment running");
         return;
@@ -499,6 +518,7 @@ async fn run_revision(
     item: Deployment,
     _permit: OwnedSemaphorePermit,
 ) {
+    let _runtime_cache = invalidate_runtime_on_exit(&state, &project.id);
     if let Err(error) = state.storage.mark_running(&item.id).await {
         tracing::error!(operation_id=%item.id,error=%error,"cannot mark rollback running");
         return;
@@ -860,6 +880,7 @@ mod tests {
             compose: Compose::new(project.clone(), override_file.clone(), runner.clone()),
             override_file,
             deploy_lock: Arc::new(Semaphore::new(1)),
+            runtime_cache: Default::default(),
         };
         (
             AppState {

@@ -14,6 +14,7 @@ use std::sync::Arc;
 const CONTAINER_LOG_DEFAULT_TAIL: u32 = 50;
 const CONTAINER_LOG_MAX_TAIL: u32 = 200;
 const HISTORY_RETENTION_DAYS: i64 = 30;
+const RUNTIME_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn router(state: AppState) -> Router {
     let csrf = CsrfToken(Arc::from(uuid::Uuid::new_v4().simple().to_string()));
@@ -130,6 +131,8 @@ struct ProjectView {
     id: String,
     compose_files: Vec<String>,
     deployment_in_progress: bool,
+    runtime_refreshing: bool,
+    runtime_error: Option<String>,
     services: Vec<ServiceView>,
 }
 
@@ -150,12 +153,16 @@ struct ServiceView {
 
 fn image_status(
     managed: bool,
+    runtime_loaded: bool,
     expected_image: Option<&str>,
     expected_image_id: Option<&str>,
     actual: &crate::compose::RuntimeState,
 ) -> &'static str {
     if !managed {
         return "unmanaged";
+    }
+    if !runtime_loaded {
+        return "unknown";
     }
     if actual.mixed_images {
         return "drift";
@@ -182,15 +189,26 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
         let project = runtime.compose.project();
         let busy = state.updates.is_active() || runtime.deploy_lock.available_permits() == 0;
         let runtime_timeout = std::time::Duration::from_secs(15).min(project.command_timeout());
-        let runtime_states = if project.services.is_empty() {
-            Ok(std::collections::BTreeMap::new())
-        } else {
-            runtime.compose.runtimes(runtime_timeout).await
-        };
-        if let Err(error) = &runtime_states {
-            tracing::warn!(project_id=%project.id,error=%error,"cannot query project containers");
+        let snapshot = runtime.runtime_cache.snapshot(RUNTIME_CACHE_MAX_AGE);
+        if snapshot.start_refresh {
+            let project_id = project.id.clone();
+            let compose = runtime.compose.clone();
+            let cache = runtime.runtime_cache.clone();
+            let no_services = project.services.is_empty();
+            tokio::spawn(async move {
+                let result = if no_services {
+                    Ok(std::collections::BTreeMap::new())
+                } else {
+                    compose.runtimes(runtime_timeout).await
+                };
+                if let Err(error) = &result {
+                    tracing::warn!(project_id=%project_id,error=%error,"cannot query project containers");
+                }
+                cache.complete(result);
+            });
         }
-        let mut runtime_states = runtime_states.ok();
+        let runtime_loaded = snapshot.states.is_some();
+        let mut runtime_states = snapshot.states;
         let mut services = Vec::new();
         for service in &project.services {
             let desired = state.storage.state(&project.id, &service.id).await?;
@@ -212,12 +230,17 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
                     actual_image_id: None,
                     replicas: 0,
                     mixed_images: false,
-                    container_status: "unknown".into(),
+                    container_status: if snapshot.refreshing {
+                        "loading".into()
+                    } else {
+                        "unknown".into()
+                    },
                 });
             let desired_image = desired.as_ref().map(|item| item.image.clone());
             let expected_image = desired.as_ref().map(|item| item.pinned_image.as_str());
             let image_status = image_status(
                 desired.is_some(),
+                runtime_loaded,
                 expected_image,
                 desired.as_ref().map(|item| item.image_id.as_str()),
                 &actual,
@@ -253,6 +276,8 @@ async fn projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectView>
                 .map(|file| file.display().to_string())
                 .collect(),
             deployment_in_progress: busy,
+            runtime_refreshing: snapshot.refreshing,
+            runtime_error: snapshot.error,
             services,
         });
     }
@@ -454,6 +479,7 @@ async fn refresh_compose(
         .map_err(|error| AppError::Internal(error.to_string()))?;
     let service_count = candidate.services.len();
     runtime.compose.replace_project(candidate);
+    runtime.runtime_cache.clear();
     state.registry.invalidate_project(&project_id).await;
     Ok(Json(serde_json::json!({
         "project_id": project_id,
@@ -833,11 +859,16 @@ mod tests {
             }
         };
         assert_eq!(
-            image_status(false, None, None, &runtime(None, None, false)),
+            image_status(false, false, None, None, &runtime(None, None, false)),
             "unmanaged"
         );
         assert_eq!(
+            image_status(true, false, None, None, &runtime(None, None, false)),
+            "unknown"
+        );
+        assert_eq!(
             image_status(
+                true,
                 true,
                 Some("repo/app:1.0.0"),
                 None,
@@ -848,6 +879,7 @@ mod tests {
         assert_eq!(
             image_status(
                 true,
+                true,
                 Some("repo/app:1.0.0"),
                 Some("sha256:one"),
                 &runtime(Some("repo/app@sha256:digest"), Some("sha256:one"), false)
@@ -857,6 +889,7 @@ mod tests {
         assert_eq!(
             image_status(
                 true,
+                true,
                 Some("repo/app:1.0.0"),
                 Some("sha256:one"),
                 &runtime(Some("repo/app@sha256:digest"), Some("sha256:two"), false)
@@ -865,6 +898,7 @@ mod tests {
         );
         assert_eq!(
             image_status(
+                true,
                 true,
                 Some("repo/app:1.0.0"),
                 None,
@@ -905,6 +939,7 @@ mod tests {
             compose: Compose::new(project, override_file.clone(), Arc::new(ProcessRunner)),
             override_file,
             deploy_lock: Arc::new(Semaphore::new(1)),
+            runtime_cache: Default::default(),
         };
         router(AppState {
             config,
@@ -953,6 +988,7 @@ mod tests {
             compose: Compose::new(project, override_file.clone(), runner.clone()),
             override_file,
             deploy_lock: Arc::new(Semaphore::new(1)),
+            runtime_cache: Default::default(),
         };
         (
             AppState {
@@ -1011,6 +1047,8 @@ mod tests {
         assert!(js.contains("/api/system/overview"));
         assert!(js.contains("/api/system/images/cleanup"));
         assert!(js.contains("/api/system/build-cache/cleanup"));
+        assert!(js.contains("visibilitychange"));
+        assert!(js.contains("project.runtime_refreshing"));
 
         let index = app
             .clone()
@@ -1104,6 +1142,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_logs.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn projects_returns_loading_state_then_reuses_async_runtime_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, runner) = refresh_state(
+            &dir,
+            vec![CommandOutput {
+                success: true,
+                log: String::new(),
+            }],
+        )
+        .await;
+
+        let first = projects(State(state.clone())).await.unwrap().0;
+        assert!(first[0].runtime_refreshing);
+        assert_eq!(first[0].services[0].container_status, "loading");
+        assert_eq!(first[0].services[0].image_status, "unmanaged");
+
+        let mut refreshed = None;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            let current = projects(State(state.clone())).await.unwrap().0;
+            if !current[0].runtime_refreshing {
+                refreshed = Some(current);
+                break;
+            }
+        }
+        let refreshed = refreshed.expect("runtime refresh should finish");
+        assert_eq!(refreshed[0].services[0].container_status, "down");
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 
     async fn csrf_token(app: &Router) -> String {
